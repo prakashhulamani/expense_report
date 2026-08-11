@@ -92,6 +92,34 @@ on the next restart, so fix the env var before relying on it.
   "Want" expenses, recurring expenses, budget performance, recommendations).
 - **🗂️ Data / Export** — full table view + CSV download of every transaction.
 
+## Sharing this app with someone else (multi-user)
+
+The app now has a simple **name-based sign-in** on first load — no password, just a
+name. Whatever name someone types becomes their "owner" tag, and every expense,
+budget, and income record they enter is saved under that tag. When you load the
+app again, everyone only sees their own data:
+
+- You open the link, type "Prakash", and see only your own records.
+- Your friend opens the same link, types their own name, and sees only theirs.
+- Neither of you sees the other's expenses, budgets, or income.
+
+**Important — this is not secure authentication.** There's no password, so anyone
+who knows (or guesses) a username can view or add data under that name. It's meant
+for casual sharing with people you trust (e.g., you and a friend, or you and your
+partner), not for anything sensitive. If you need real login security later, that's
+a bigger change (e.g., `streamlit-authenticator` with hashed passwords) — that can
+be added on top of this if you want it.
+
+A "🔓 Switch user" button in the sidebar lets you sign out and enter a different
+name in the same browser tab.
+
+**If you already had data before this feature was added:** on first run after
+this update, the app automatically tags all your existing records with a
+placeholder owner (`legacy`) so nothing is lost. Sign in with your real name, then
+click **"📥 Claim old data"** in the sidebar once — it re-tags all `legacy` records
+as yours. Do this only once, and only from the account that should own that old
+data.
+
 ## Notes
 
 - All the "automatic calculations" (daily/monthly/yearly totals, %s, comparisons,
