@@ -104,6 +104,7 @@ metadata = MetaData()
 transactions_table = Table(
     "transactions", metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("owner", String(100)),
     Column("date", String(20), nullable=False),
     Column("day", String(20), nullable=False),
     Column("category", String(100), nullable=False),
@@ -121,6 +122,7 @@ transactions_table = Table(
 
 budgets_table = Table(
     "budgets", metadata,
+    Column("owner", String(100), primary_key=True),
     Column("month", String(7), primary_key=True),
     Column("category", String(100), primary_key=True),
     Column("amount", Float, nullable=False),
@@ -128,22 +130,50 @@ budgets_table = Table(
 
 income_table = Table(
     "income", metadata,
+    Column("owner", String(100), primary_key=True),
     Column("month", String(7), primary_key=True),
     Column("amount", Float, nullable=False),
 )
+
+# Name used to tag any data that existed before per-user accounts were added,
+# so nothing already saved gets lost — it just becomes visible under this
+# username. Log in as this name once to see/reclaim older records.
+LEGACY_OWNER = "legacy"
 
 
 def init_db():
     # create_all emits the correct dialect-specific DDL (e.g. SERIAL vs
     # AUTOINCREMENT) automatically based on the engine, so this works
-    # unchanged for both SQLite and Postgres.
+    # unchanged for both SQLite and Postgres. For tables that already existed
+    # before the "owner" column was introduced, this alone won't add it —
+    # _migrate_add_owner_columns() below handles that.
     metadata.create_all(engine)
+    _migrate_add_owner_columns()
 
 
-def add_transaction(row: dict):
+def _migrate_add_owner_columns():
+    """Add an 'owner' column to any pre-existing tables that don't have one
+    yet, and tag their existing rows as LEGACY_OWNER so old data is still
+    reachable (by signing in with that username) instead of disappearing."""
+    from sqlalchemy import inspect, text as satext
+    inspector = inspect(engine)
+    existing_tables = inspector.get_table_names()
+    with engine.begin() as conn:
+        for table_name in ["transactions", "budgets", "income"]:
+            if table_name not in existing_tables:
+                continue
+            cols = [c["name"] for c in inspector.get_columns(table_name)]
+            if "owner" not in cols:
+                conn.execute(satext(f"ALTER TABLE {table_name} ADD COLUMN owner VARCHAR(100)"))
+            conn.execute(satext(
+                f"UPDATE {table_name} SET owner = :legacy WHERE owner IS NULL"
+            ), {"legacy": LEGACY_OWNER})
+
+
+def add_transaction(row: dict, owner: str):
     with engine.begin() as conn:
         conn.execute(transactions_table.insert().values(
-            date=row["date"], day=row["day"], category=row["category"],
+            owner=owner, date=row["date"], day=row["day"], category=row["category"],
             subcategory=row["subcategory"], description=row["description"],
             payment_method=row["payment_method"], amount=row["amount"],
             need_want=row["need_want"], recurring=row["recurring"],
@@ -152,14 +182,22 @@ def add_transaction(row: dict):
         ))
 
 
-def delete_transaction(tx_id: int):
+def delete_transaction(tx_id: int, owner: str):
+    # Filtering by owner too means a user can't delete another user's
+    # transaction even if they guess/enter its numeric ID.
     with engine.begin() as conn:
-        conn.execute(transactions_table.delete().where(transactions_table.c.id == tx_id))
+        conn.execute(transactions_table.delete().where(
+            and_(transactions_table.c.id == tx_id, transactions_table.c.owner == owner)
+        ))
 
 
 @st.cache_data(ttl=2)
-def load_transactions(_refresh_token=0) -> pd.DataFrame:
-    df = pd.read_sql_query("SELECT * FROM transactions ORDER BY date ASC, id ASC", engine)
+def load_transactions(owner: str, _refresh_token=0) -> pd.DataFrame:
+    from sqlalchemy import text as satext
+    df = pd.read_sql_query(
+        satext("SELECT * FROM transactions WHERE owner = :owner ORDER BY date ASC, id ASC"),
+        engine, params={"owner": owner},
+    )
     if df.empty:
         return df
     df["date"] = pd.to_datetime(df["date"])
@@ -170,30 +208,48 @@ def load_transactions(_refresh_token=0) -> pd.DataFrame:
     return df
 
 
-def set_budget(month: str, category: str, amount: float):
+def set_budget(month: str, category: str, amount: float, owner: str):
     # Portable "upsert": delete any existing row then insert, inside one
     # transaction — avoids relying on dialect-specific ON CONFLICT syntax.
     with engine.begin() as conn:
         conn.execute(budgets_table.delete().where(
-            and_(budgets_table.c.month == month, budgets_table.c.category == category)
+            and_(budgets_table.c.month == month, budgets_table.c.category == category,
+                 budgets_table.c.owner == owner)
         ))
-        conn.execute(budgets_table.insert().values(month=month, category=category, amount=amount))
+        conn.execute(budgets_table.insert().values(owner=owner, month=month, category=category, amount=amount))
 
 
 @st.cache_data(ttl=2)
-def get_budgets(_refresh_token=0) -> pd.DataFrame:
-    return pd.read_sql_query("SELECT * FROM budgets", engine)
+def get_budgets(owner: str, _refresh_token=0) -> pd.DataFrame:
+    from sqlalchemy import text as satext
+    return pd.read_sql_query(
+        satext("SELECT * FROM budgets WHERE owner = :owner"), engine, params={"owner": owner}
+    )
 
 
-def set_income(month: str, amount: float):
+def set_income(month: str, amount: float, owner: str):
     with engine.begin() as conn:
-        conn.execute(income_table.delete().where(income_table.c.month == month))
-        conn.execute(income_table.insert().values(month=month, amount=amount))
+        conn.execute(income_table.delete().where(
+            and_(income_table.c.month == month, income_table.c.owner == owner)
+        ))
+        conn.execute(income_table.insert().values(owner=owner, month=month, amount=amount))
 
 
 @st.cache_data(ttl=2)
-def get_income(_refresh_token=0) -> pd.DataFrame:
-    return pd.read_sql_query("SELECT * FROM income", engine)
+def get_income(owner: str, _refresh_token=0) -> pd.DataFrame:
+    from sqlalchemy import text as satext
+    return pd.read_sql_query(
+        satext("SELECT * FROM income WHERE owner = :owner"), engine, params={"owner": owner}
+    )
+
+
+def claim_legacy_data(owner: str):
+    """One-time helper: re-tag any pre-account data (owner = LEGACY_OWNER)
+    as belonging to the current user. Used from the sidebar so whoever used
+    the app before accounts existed can pull their old records back in."""
+    with engine.begin() as conn:
+        for table in (transactions_table, budgets_table, income_table):
+            conn.execute(table.update().where(table.c.owner == LEGACY_OWNER).values(owner=owner))
 
 
 def bump_token():
@@ -236,12 +292,50 @@ def month_label_to_name(m):
 st.set_page_config(page_title="Personal Expense Tracker", page_icon="💰", layout="wide")
 init_db()
 
+# --- Simple name-based sign-in -----------------------------------------
+# Not a secure login (no password) — it just tags every record with a
+# username so multiple people can share one deployed app without seeing
+# each other's data. Anyone who knows a username can view/enter data under
+# it, so agree on unique names with whoever you share the link with.
+if "username" not in st.session_state:
+    st.title("💰 Personal Expense Tracker")
+    st.subheader("👋 Who's tracking expenses?")
+    with st.form("login_form"):
+        uname = st.text_input("Enter your name", placeholder="e.g., Prakash")
+        go = st.form_submit_button("Continue", type="primary", use_container_width=True)
+        if go:
+            clean = uname.strip()
+            if not clean:
+                st.error("Please enter a name.")
+            else:
+                st.session_state["username"] = clean.lower().replace(" ", "_")
+                st.session_state["display_name"] = clean
+                st.rerun()
+    st.caption("This is simple name-based separation, not a password login — anyone who knows "
+               "a username can see data saved under it. Use a distinct name per person sharing this app.")
+    st.stop()
+
+CURRENT_USER = st.session_state["username"]
+
 token = st.session_state.get("refresh_token", 0)
-df_all = load_transactions(token)
-budgets_all = get_budgets(token)
-income_all = get_income(token)
+df_all = load_transactions(CURRENT_USER, token)
+budgets_all = get_budgets(CURRENT_USER, token)
+income_all = get_income(CURRENT_USER, token)
 
 st.sidebar.title("💰 Expense Tracker")
+st.sidebar.markdown(f"👤 Signed in as **{st.session_state.get('display_name', CURRENT_USER)}**")
+c_switch, c_claim = st.sidebar.columns(2)
+if c_switch.button("🔓 Switch user", use_container_width=True):
+    for k in ("username", "display_name"):
+        st.session_state.pop(k, None)
+    st.rerun()
+if c_claim.button("📥 Claim old data", use_container_width=True,
+                   help="Pulls in any records saved before per-user accounts existed."):
+    claim_legacy_data(CURRENT_USER)
+    bump_token()
+    st.sidebar.success("Old data claimed.")
+    st.rerun()
+
 if USING_EXTERNAL_DB:
     st.sidebar.caption("🟢 Connected to external Postgres database")
 else:
@@ -319,7 +413,7 @@ if nav == "➕ Add Expense":
                     "fixed_variable": fixed_variable,
                     "person": person,
                     "notes": notes,
-                })
+                }, CURRENT_USER)
                 bump_token()
                 st.success(f"Saved: {fmt(amount)} — {category} / {subcategory} on {tx_date}")
                 st.rerun()
@@ -341,7 +435,7 @@ if nav == "➕ Add Expense":
         with st.expander("🗑️ Delete a transaction"):
             del_id = st.number_input("Transaction ID to delete", min_value=1, step=1)
             if st.button("Delete"):
-                delete_transaction(int(del_id))
+                delete_transaction(int(del_id), CURRENT_USER)
                 bump_token()
                 st.success(f"Deleted transaction {del_id}")
                 st.rerun()
@@ -694,7 +788,7 @@ elif nav == "💵 Budget & Income Settings":
     default_income = float(existing_income["amount"].iloc[0]) if not existing_income.empty else 0.0
     inc_val = st.number_input("Monthly Income", min_value=0.0, value=default_income, step=1000.0, format="%.2f")
     if st.button("💾 Save Income"):
-        set_income(month_str, inc_val)
+        set_income(month_str, inc_val, CURRENT_USER)
         bump_token()
         st.success(f"Income for {month_label_to_name(month_str)} saved: {fmt(inc_val)}")
         st.rerun()
@@ -716,7 +810,7 @@ elif nav == "💵 Budget & Income Settings":
         if save_budgets:
             for cat, amt in budget_inputs.items():
                 if amt > 0:
-                    set_budget(month_str, cat, amt)
+                    set_budget(month_str, cat, amt, CURRENT_USER)
             bump_token()
             st.success(f"Budgets saved for {month_label_to_name(month_str)}. Total budget: {fmt(sum(budget_inputs.values()))}")
             st.rerun()
