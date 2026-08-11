@@ -1,1001 +1,1105 @@
 """
-Personal Expense Tracker
-=========================
-A comprehensive Streamlit application for daily expense entry with
-automatic daily / monthly / yearly analysis, budgets, savings tracking,
-fixed vs variable & need vs want breakdowns, recurring expense tracking,
-trend charts, and end-of-month / end-of-year narrative reports.
+Personal Expense Tracker — Streamlit App
+==========================================
+A single-file Streamlit app backed by a database via SQLAlchemy.
+Enter expenses daily; monthly & yearly summaries, budgets, savings,
+fixed/variable, need/want, recurring tracking, and trend charts are
+all computed automatically from the same running dataset (no need to
+create a new file every month/year).
 
-Data is stored in a local SQLite database (expense_tracker.db) so the
-same file/app can be used continuously all year round without ever
-creating a new spreadsheet.
+STORAGE:
+- Locally: defaults to a SQLite file (expenses.db) next to this script.
+- On Render (or any host with an ephemeral filesystem): set the DATABASE_URL
+  environment variable to a free external Postgres connection string
+  (e.g. from Neon.tech or Supabase) so your data survives restarts and
+  redeploys. See README.md for step-by-step setup.
 
-Run with:
-    pip install -r requirements.txt
-    streamlit run app.py
+Run with:  streamlit run app.py
 """
 
 import os
 import calendar
-import sqlite3
 from datetime import date, datetime, timedelta
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from sqlalchemy import (
+    create_engine, MetaData, Table, Column, Integer, String, Float,
+    Text as SAText, and_,
+)
 import streamlit as st
 
-# --------------------------------------------------------------------------
-# CONFIG
-# --------------------------------------------------------------------------
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(APP_DIR, "expense_tracker.db")
+# ----------------------------------------------------------------------------
+# CONFIG / CONSTANTS
+# ----------------------------------------------------------------------------
 
-st.set_page_config(
-    page_title="Personal Expense Tracker",
-    page_icon="💰",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+# DATABASE_URL comes from the environment on Render (point it at a free
+# Postgres instance from Neon.tech or Supabase — see README.md). If it's
+# not set, we fall back to a local SQLite file for local development.
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///expenses.db")
+# Some providers (Render, Heroku) hand out "postgres://" URLs, but
+# SQLAlchemy's modern driver name is "postgresql://".
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+USING_EXTERNAL_DB = DATABASE_URL.startswith("postgresql://")
 
-CATEGORY_MAP = {
-    "Groceries": ["Supermarket", "Kirana Store", "Online Grocery", "Bulk Purchase", "Other"],
-    "Food / Restaurants": ["Dining Out", "Food Delivery", "Coffee / Tea / Snacks", "Milk", "Office Lunch", "Other"],
+CURRENCY = "₹"
+
+CATEGORY_SUBCATEGORIES = {
+    "Groceries": ["Supermarket", "Kirana / Local Store", "Online Grocery", "Other"],
+    "Food / Restaurants": ["Dining Out", "Food Delivery", "Cafe / Coffee", "Snacks", "Other"],
     "Vegetables / Fruits": ["Vegetables", "Fruits", "Other"],
-    "Utilities": ["Electricity", "Water", "Gas", "Internet / Mobile", "DTH / Cable", "Other"],
-    "Rent / Home Loan": ["Rent", "Home Loan EMI", "Maintenance / Society", "Other"],
-    "Transportation / Fuel": ["Fuel / Petrol / Diesel", "Cab / Auto / Taxi", "Public Transport", "Parking / Toll", "Other"],
-    "Vehicle Maintenance": ["Service", "Repair", "Insurance Renewal", "Accessories", "Other"],
-    "Medical": ["Doctor Consultation", "Medicines", "Diagnostic Tests", "Hospitalization", "Health Checkup", "Other"],
-    "Education": ["School / College Fees", "Tuition / Coaching", "Books / Study Material", "Online Courses", "Other"],
-    "Insurance": ["Life Insurance", "Health Insurance", "Vehicle Insurance", "Other"],
-    "Investments": ["Mutual Funds / SIP", "Stocks", "PPF / EPF", "Fixed Deposit", "Gold", "Other"],
-    "Shopping": ["Clothing", "Electronics", "Footwear", "Accessories", "Online Shopping", "Other"],
-    "Entertainment": ["Movies", "OTT Subscriptions", "Outings", "Events / Concerts", "Games", "Other"],
-    "Travel": ["Flights", "Hotels", "Local Sightseeing", "Train / Bus", "Other"],
-    "Personal Care": ["Salon / Grooming", "Cosmetics", "Gym / Fitness", "Spa / Wellness", "Other"],
-    "Household": ["Cleaning Supplies", "Kitchen Items", "Repairs / Maintenance", "Furniture", "Appliances", "Other"],
-    "EMI / Loans": ["Personal Loan", "Credit Card EMI", "Consumer Durable Loan", "Other Loan", "Other"],
-    "Bank / Financial Charges": ["Bank Fees", "Credit Card Charges", "Late Fees", "Service Charges", "Other"],
-    "Gifts / Donations": ["Gifts", "Charity / Donation", "Religious Offerings", "Other"],
-    "Children's Expenses": ["School Supplies", "Toys", "Activities / Classes", "Clothing", "Other"],
-    "Family Expenses": ["Parents Support", "Family Events", "Other"],
-    "Miscellaneous": ["Uncategorized", "Other"],
+    "Utilities": ["Gas Cylinder", "Maintenance / Society", "Other"],
+    "Electricity": ["Bill Payment", "Other"],
+    "Water": ["Bill Payment", "Other"],
+    "Internet / Mobile": ["Broadband", "Mobile Recharge", "DTH / Cable", "Other"],
+    "Rent / Home Loan": ["Rent", "Home Loan EMI", "Society Maintenance", "Other"],
+    "Transportation / Fuel": ["Fuel", "Cab / Taxi", "Public Transport", "Parking", "Toll", "Other"],
+    "Vehicle Maintenance": ["Service", "Repair", "Spare Parts", "Car/Bike Wash", "Other"],
+    "Medical": ["Doctor Consultation", "Medicines", "Diagnostics / Lab", "Hospital", "Health Insurance Premium", "Other"],
+    "Education": ["Tuition Fee", "School / College Fee", "Books / Study Material", "Online Courses", "Other"],
+    "Insurance": ["Life Insurance", "Health Insurance", "Vehicle Insurance", "Home Insurance", "Other"],
+    "Investments": ["Mutual Fund SIP", "Stocks", "FD / RD", "PPF / EPF", "Gold", "Other"],
+    "Shopping": ["Clothing", "Electronics", "Accessories", "Online Shopping", "Other"],
+    "Entertainment": ["Movies", "OTT Subscriptions", "Outings", "Events / Concerts", "Other"],
+    "Travel": ["Flights", "Trains / Buses", "Hotels", "Local Transport", "Sightseeing", "Other"],
+    "Personal Care": ["Salon / Grooming", "Gym / Fitness", "Cosmetics", "Spa / Wellness", "Other"],
+    "Household": ["Furniture", "Appliances", "Repairs", "Cleaning Supplies", "Other"],
+    "EMI / Loans": ["Personal Loan", "Car Loan", "Credit Card EMI", "Other"],
+    "Bank / Financial Charges": ["Bank Fees", "Late Fees", "Interest Charges", "Card Annual Fee", "Other"],
+    "Gifts / Donations": ["Gifts", "Charity", "Religious Donation", "Other"],
+    "Children's Expenses": ["School Fee", "Tuition", "Toys", "Clothing", "Activities", "Other"],
+    "Family Expenses": ["Parents", "Siblings", "Relatives", "Other"],
+    "Miscellaneous": ["Other"],
+}
+CATEGORIES = list(CATEGORY_SUBCATEGORIES.keys())
+
+# Categories treated as "Fixed" spend by default (recurring, largely non-discretionary)
+FIXED_CATEGORIES = {
+    "Rent / Home Loan", "EMI / Loans", "Insurance", "Internet / Mobile",
+    "Utilities", "Electricity", "Water",
 }
 
 PAYMENT_METHODS = ["Cash", "Credit Card", "Debit Card", "UPI", "Net Banking", "Wallet", "Other"]
-PERSON_OPTIONS = ["Self", "Spouse", "Child", "Parents", "Family (Shared)", "Other"]
+PERSON_OPTIONS = ["Self", "Spouse", "Child", "Parent", "Family", "Other"]
 
-DEFAULT_FIXED_CATEGORIES = {
-    "Rent / Home Loan", "EMI / Loans", "Insurance", "Utilities",
-    "Education", "Investments", "Bank / Financial Charges",
-}
+MONTH_NAMES = list(calendar.month_name)[1:]
 
-MONTH_FMT = "%Y-%m"
-DATE_FMT = "%Y-%m-%d"
+# ----------------------------------------------------------------------------
+# DATABASE LAYER (SQLAlchemy — works with local SQLite or a hosted Postgres)
+# ----------------------------------------------------------------------------
 
-# --------------------------------------------------------------------------
-# DATABASE
-# --------------------------------------------------------------------------
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+@st.cache_resource
+def get_engine():
+    # pool_pre_ping avoids "server closed the connection" errors after a free
+    # Postgres instance has been idle; pool_recycle keeps connections fresh.
+    return create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=280)
+
+
+engine = get_engine()
+metadata = MetaData()
+
+transactions_table = Table(
+    "transactions", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("date", String(20), nullable=False),
+    Column("day", String(20), nullable=False),
+    Column("category", String(100), nullable=False),
+    Column("subcategory", String(100)),
+    Column("description", SAText),
+    Column("payment_method", String(50)),
+    Column("amount", Float, nullable=False),
+    Column("need_want", String(10)),
+    Column("recurring", String(20)),
+    Column("fixed_variable", String(10)),
+    Column("person", String(50)),
+    Column("notes", SAText),
+    Column("created_at", String(40)),
+)
+
+budgets_table = Table(
+    "budgets", metadata,
+    Column("month", String(7), primary_key=True),
+    Column("category", String(100), primary_key=True),
+    Column("amount", Float, nullable=False),
+)
+
+income_table = Table(
+    "income", metadata,
+    Column("month", String(7), primary_key=True),
+    Column("amount", Float, nullable=False),
+)
 
 
 def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,
-            day TEXT NOT NULL,
-            category TEXT NOT NULL,
-            subcategory TEXT,
-            description TEXT,
-            payment_method TEXT,
-            amount REAL NOT NULL,
-            need_want TEXT,
-            recurring TEXT,
-            person TEXT,
-            notes TEXT,
-            created_at TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS budgets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            month TEXT NOT NULL,
-            category TEXT NOT NULL,
-            budget_amount REAL NOT NULL,
-            UNIQUE(month, category)
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS income (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            month TEXT NOT NULL UNIQUE,
-            amount REAL NOT NULL
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS category_class (
-            category TEXT PRIMARY KEY,
-            classification TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-
-    # Seed default fixed/variable classification if empty
-    existing = pd.read_sql("SELECT category FROM category_class", conn)["category"].tolist()
-    for cat in CATEGORY_MAP.keys():
-        if cat not in existing:
-            cls = "Fixed" if cat in DEFAULT_FIXED_CATEGORIES else "Variable"
-            cur.execute(
-                "INSERT OR IGNORE INTO category_class (category, classification) VALUES (?,?)",
-                (cat, cls),
-            )
-    conn.commit()
-    conn.close()
+    # create_all emits the correct dialect-specific DDL (e.g. SERIAL vs
+    # AUTOINCREMENT) automatically based on the engine, so this works
+    # unchanged for both SQLite and Postgres.
+    metadata.create_all(engine)
 
 
-def run_query(query, params=None):
-    conn = get_conn()
-    df = pd.read_sql(query, conn, params=params or [])
-    conn.close()
+def add_transaction(row: dict):
+    with engine.begin() as conn:
+        conn.execute(transactions_table.insert().values(
+            date=row["date"], day=row["day"], category=row["category"],
+            subcategory=row["subcategory"], description=row["description"],
+            payment_method=row["payment_method"], amount=row["amount"],
+            need_want=row["need_want"], recurring=row["recurring"],
+            fixed_variable=row["fixed_variable"], person=row["person"],
+            notes=row["notes"], created_at=datetime.now().isoformat(),
+        ))
+
+
+def delete_transaction(tx_id: int):
+    with engine.begin() as conn:
+        conn.execute(transactions_table.delete().where(transactions_table.c.id == tx_id))
+
+
+@st.cache_data(ttl=2)
+def load_transactions(_refresh_token=0) -> pd.DataFrame:
+    df = pd.read_sql_query("SELECT * FROM transactions ORDER BY date ASC, id ASC", engine)
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    df["year"] = df["date"].dt.year
+    df["month"] = df["date"].dt.month
+    df["month_label"] = df["date"].dt.strftime("%Y-%m")
+    df["month_name"] = df["date"].dt.strftime("%b %Y")
     return df
 
 
-def execute(query, params=None):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(query, params or [])
-    conn.commit()
-    conn.close()
+def set_budget(month: str, category: str, amount: float):
+    # Portable "upsert": delete any existing row then insert, inside one
+    # transaction — avoids relying on dialect-specific ON CONFLICT syntax.
+    with engine.begin() as conn:
+        conn.execute(budgets_table.delete().where(
+            and_(budgets_table.c.month == month, budgets_table.c.category == category)
+        ))
+        conn.execute(budgets_table.insert().values(month=month, category=category, amount=amount))
 
 
-def load_expenses():
-    df = run_query("SELECT * FROM expenses ORDER BY date DESC, id DESC")
-    if not df.empty:
-        df["date"] = pd.to_datetime(df["date"])
-        df["month"] = df["date"].dt.strftime(MONTH_FMT)
-        df["year"] = df["date"].dt.year
-    return df
+@st.cache_data(ttl=2)
+def get_budgets(_refresh_token=0) -> pd.DataFrame:
+    return pd.read_sql_query("SELECT * FROM budgets", engine)
 
 
-def load_class_map():
-    df = run_query("SELECT * FROM category_class")
-    return dict(zip(df["category"], df["classification"]))
+def set_income(month: str, amount: float):
+    with engine.begin() as conn:
+        conn.execute(income_table.delete().where(income_table.c.month == month))
+        conn.execute(income_table.insert().values(month=month, amount=amount))
 
 
-def load_budgets():
-    return run_query("SELECT * FROM budgets")
+@st.cache_data(ttl=2)
+def get_income(_refresh_token=0) -> pd.DataFrame:
+    return pd.read_sql_query("SELECT * FROM income", engine)
 
 
-def load_income():
-    return run_query("SELECT * FROM income")
+def bump_token():
+    st.session_state["refresh_token"] = st.session_state.get("refresh_token", 0) + 1
+    load_transactions.clear()
+    get_budgets.clear()
+    get_income.clear()
 
 
-# --------------------------------------------------------------------------
-# HELPERS
-# --------------------------------------------------------------------------
-def money(x):
+# ----------------------------------------------------------------------------
+# FORMATTING HELPERS
+# ----------------------------------------------------------------------------
+
+def fmt(x):
     try:
-        return f"₹{x:,.2f}"
-    except (TypeError, ValueError):
-        return "₹0.00"
+        return f"{CURRENCY}{x:,.2f}"
+    except Exception:
+        return f"{CURRENCY}0.00"
 
 
 def pct(x):
     try:
-        return f"{x:.1f}%"
-    except (TypeError, ValueError):
+        return f"{x:,.1f}%"
+    except Exception:
         return "0.0%"
 
 
-def month_options(df):
-    if df.empty:
-        return [datetime.now().strftime(MONTH_FMT)]
-    months = sorted(df["month"].unique(), reverse=True)
-    return months
+def month_label_to_name(m):
+    try:
+        y, mo = m.split("-")
+        return f"{calendar.month_abbr[int(mo)]} {y}"
+    except Exception:
+        return m
 
 
-def year_options(df):
-    if df.empty:
-        return [datetime.now().year]
-    return sorted(df["year"].unique(), reverse=True)
+# ----------------------------------------------------------------------------
+# APP SETUP
+# ----------------------------------------------------------------------------
 
-
-def get_budget_for(month, category, budgets_df):
-    row = budgets_df[(budgets_df["month"] == month) & (budgets_df["category"] == category)]
-    if row.empty:
-        return 0.0
-    return float(row["budget_amount"].iloc[0])
-
-
-def upsert_budget(month, category, amount):
-    execute(
-        """INSERT INTO budgets (month, category, budget_amount) VALUES (?,?,?)
-           ON CONFLICT(month, category) DO UPDATE SET budget_amount=excluded.budget_amount""",
-        (month, category, amount),
-    )
-
-
-def upsert_income(month, amount):
-    execute(
-        """INSERT INTO income (month, amount) VALUES (?,?)
-           ON CONFLICT(month) DO UPDATE SET amount=excluded.amount""",
-        (month, amount),
-    )
-
-
-def prev_month_str(month_str):
-    d = datetime.strptime(month_str, MONTH_FMT)
-    first = d.replace(day=1) - timedelta(days=1)
-    return first.strftime(MONTH_FMT)
-
-
-# --------------------------------------------------------------------------
-# INIT
-# --------------------------------------------------------------------------
+st.set_page_config(page_title="Personal Expense Tracker", page_icon="💰", layout="wide")
 init_db()
-df_all = load_expenses()
-class_map = load_class_map()
-budgets_df = load_budgets()
-income_df = load_income()
 
-# --------------------------------------------------------------------------
-# SIDEBAR NAVIGATION
-# --------------------------------------------------------------------------
+token = st.session_state.get("refresh_token", 0)
+df_all = load_transactions(token)
+budgets_all = get_budgets(token)
+income_all = get_income(token)
+
 st.sidebar.title("💰 Expense Tracker")
-page = st.sidebar.radio(
+if USING_EXTERNAL_DB:
+    st.sidebar.caption("🟢 Connected to external Postgres database")
+else:
+    st.sidebar.caption("🟡 Using local SQLite (won't persist on Render free tier)")
+nav = st.sidebar.radio(
     "Navigate",
     [
-        "📝 Add Expense",
-        "📋 Transactions",
-        "📊 Dashboards",
-        "🔍 Deep Analysis",
-        "📑 Reports",
-        "⚙️ Settings",
+        "➕ Add Expense",
+        "📅 Daily Dashboard",
+        "🗓️ Monthly Dashboard",
+        "📆 Yearly Dashboard",
+        "📊 Category Analysis",
+        "💵 Budget & Income Settings",
+        "🏦 Savings Analysis",
+        "🔁 Recurring Tracker",
+        "📈 Trends & Charts",
+        "📝 Monthly Review",
+        "📘 Yearly Review",
+        "🗂️ Data / Export",
     ],
 )
 
-st.sidebar.markdown("---")
 if not df_all.empty:
-    st.sidebar.metric("Total Transactions", len(df_all))
-    st.sidebar.metric("Total Recorded", money(df_all["amount"].sum()))
-    st.sidebar.caption(f"Data range: {df_all['date'].min().date()} → {df_all['date'].max().date()}")
-else:
-    st.sidebar.info("No expenses recorded yet. Start by adding one!")
+    st.sidebar.markdown("---")
+    st.sidebar.caption(f"Total transactions logged: **{len(df_all)}**")
+    st.sidebar.caption(f"Date range: {df_all['date'].min().date()} → {df_all['date'].max().date()}")
 
-# ==========================================================================
-# PAGE 1: ADD EXPENSE
-# ==========================================================================
-if page == "📝 Add Expense":
-    st.title("📝 Add Expense")
-    st.caption("Enter today's (or any day's) expense. Summaries update automatically.")
+# ============================================================================
+# PAGE: ADD EXPENSE
+# ============================================================================
+if nav == "➕ Add Expense":
+    st.title("➕ Add a New Expense")
+    st.caption("Enter one transaction at a time. Day, Fixed/Variable are derived automatically.")
 
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        entry_date = st.date_input("Date", value=date.today(), key="entry_date")
-    with col2:
-        st.text_input("Day", value=entry_date.strftime("%A"), disabled=True)
+    with st.form("add_expense_form", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            tx_date = st.date_input("Date", value=date.today())
+            category = st.selectbox("Expense Category", CATEGORIES)
+        with c2:
+            subcategory = st.selectbox("Expense Sub-Category", CATEGORY_SUBCATEGORIES[category])
+            payment_method = st.selectbox("Payment Method", PAYMENT_METHODS)
+        with c3:
+            amount = st.number_input("Amount", min_value=0.0, step=10.0, format="%.2f")
+            person = st.selectbox("Person / Family Member", PERSON_OPTIONS)
 
-    col3, col4 = st.columns([1, 1])
-    with col3:
-        category = st.selectbox("Expense Category", list(CATEGORY_MAP.keys()), key="entry_category")
-    with col4:
-        sub_options = CATEGORY_MAP[category] 
-        subcategory = st.selectbox("Expense Sub-Category", sub_options, key="entry_subcategory")
-        if subcategory == "Other":
-            subcategory = st.text_input("Specify Sub-Category", key="entry_subcategory_custom") or "Other"
+        description = st.text_input("Description / Purpose", placeholder="e.g., Weekly grocery run at BigBasket")
 
-    description = st.text_input("Description / Purpose", key="entry_description")
+        c4, c5 = st.columns(2)
+        with c4:
+            need_want = st.radio("Need / Want", ["Need", "Want"], horizontal=True)
+        with c5:
+            recurring = st.radio("Recurring / One-Time", ["Recurring", "One-Time"], horizontal=True)
 
-    col5, col6, col7 = st.columns(3)
-    with col5:
-        payment_method = st.selectbox("Payment Method", PAYMENT_METHODS, key="entry_payment")
-    with col6:
-        amount = st.number_input("Amount (₹)", min_value=0.0, step=10.0, format="%.2f", key="entry_amount")
-    with col7:
-        need_want = st.radio("Need / Want", ["Need", "Want"], horizontal=True, key="entry_need_want")
+        notes = st.text_area("Notes (optional)", height=60)
 
-    col8, col9 = st.columns(2)
-    with col8:
-        recurring = st.radio("Recurring / One-Time", ["Recurring", "One-Time"], horizontal=True, key="entry_recurring")
-    with col9:
-        person = st.selectbox("Person / Family Member", PERSON_OPTIONS, key="entry_person")
-        if person == "Other":
-            person = st.text_input("Specify Person", key="entry_person_custom") or "Other"
+        submitted = st.form_submit_button("💾 Save Expense", use_container_width=True, type="primary")
 
-    notes = st.text_area("Notes", key="entry_notes", height=80)
+        if submitted:
+            if amount <= 0:
+                st.error("Please enter an amount greater than 0.")
+            else:
+                day_name = tx_date.strftime("%A")
+                fixed_variable = "Fixed" if category in FIXED_CATEGORIES else "Variable"
+                add_transaction({
+                    "date": tx_date.isoformat(),
+                    "day": day_name,
+                    "category": category,
+                    "subcategory": subcategory,
+                    "description": description,
+                    "payment_method": payment_method,
+                    "amount": amount,
+                    "need_want": need_want,
+                    "recurring": recurring,
+                    "fixed_variable": fixed_variable,
+                    "person": person,
+                    "notes": notes,
+                })
+                bump_token()
+                st.success(f"Saved: {fmt(amount)} — {category} / {subcategory} on {tx_date}")
+                st.rerun()
 
-    if st.button("➕ Add Expense", type="primary", use_container_width=True):
-        if amount <= 0:
-            st.error("Please enter an amount greater than 0.")
+    st.markdown("---")
+    st.subheader("Recent Entries")
+    if df_all.empty:
+        st.info("No expenses logged yet. Add your first one above!")
+    else:
+        recent = df_all.sort_values("date", ascending=False).head(15)
+        show_cols = ["date", "day", "category", "subcategory", "amount", "payment_method",
+                     "need_want", "recurring", "person"]
+        st.dataframe(recent[show_cols].rename(columns={
+            "date": "Date", "day": "Day", "category": "Category", "subcategory": "Sub-Category",
+            "amount": "Amount", "payment_method": "Payment", "need_want": "Need/Want",
+            "recurring": "Recurring", "person": "Person"
+        }), use_container_width=True, hide_index=True)
+
+        with st.expander("🗑️ Delete a transaction"):
+            del_id = st.number_input("Transaction ID to delete", min_value=1, step=1)
+            if st.button("Delete"):
+                delete_transaction(int(del_id))
+                bump_token()
+                st.success(f"Deleted transaction {del_id}")
+                st.rerun()
+
+# ============================================================================
+# PAGE: DAILY DASHBOARD
+# ============================================================================
+elif nav == "📅 Daily Dashboard":
+    st.title("📅 Daily Expense Summary")
+
+    if df_all.empty:
+        st.info("No data yet. Add expenses first.")
+    else:
+        sel_date = st.date_input("Select date", value=df_all["date"].max().date())
+        day_df = df_all[df_all["date"].dt.date == sel_date]
+
+        if day_df.empty:
+            st.warning("No transactions on this date.")
         else:
-            execute(
-                """INSERT INTO expenses
-                   (date, day, category, subcategory, description, payment_method,
-                    amount, need_want, recurring, person, notes, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    entry_date.strftime(DATE_FMT),
-                    entry_date.strftime("%A"),
-                    category,
-                    subcategory,
-                    description,
-                    payment_method,
-                    amount,
-                    need_want,
-                    recurring,
-                    person,
-                    notes,
-                    datetime.now().isoformat(),
-                ),
-            )
-            st.success(f"Added {money(amount)} under {category} / {subcategory} on {entry_date}.")
+            total = day_df["amount"].sum()
+            count = len(day_df)
+            highest = day_df.loc[day_df["amount"].idxmax()]
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Expense for the Day", fmt(total))
+            c2.metric("Number of Transactions", count)
+            c3.metric("Highest Expense", fmt(highest["amount"]), help=f"{highest['category']} - {highest['description']}")
+
+            st.markdown("#### Category-wise Spending")
+            cat_sum = day_df.groupby("category")["amount"].sum().sort_values(ascending=False)
+            fig = px.bar(cat_sum, x=cat_sum.values, y=cat_sum.index, orientation="h",
+                         labels={"x": "Amount", "y": "Category"}, text_auto=".2s")
+            fig.update_layout(height=350, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+            c4, c5 = st.columns(2)
+            with c4:
+                st.markdown("#### Need vs Want")
+                nw = day_df.groupby("need_want")["amount"].sum()
+                st.plotly_chart(px.pie(nw, values=nw.values, names=nw.index, hole=0.45),
+                                 use_container_width=True)
+            with c5:
+                st.markdown("#### Recurring vs One-Time")
+                rc = day_df.groupby("recurring")["amount"].sum()
+                st.plotly_chart(px.pie(rc, values=rc.values, names=rc.index, hole=0.45),
+                                 use_container_width=True)
+
+            st.markdown("#### All Transactions on This Day")
+            st.dataframe(day_df[["date", "category", "subcategory", "description", "amount",
+                                  "payment_method", "need_want", "recurring", "person", "notes"]],
+                         use_container_width=True, hide_index=True)
+
+# ============================================================================
+# PAGE: MONTHLY DASHBOARD
+# ============================================================================
+elif nav == "🗓️ Monthly Dashboard":
+    st.title("🗓️ Monthly Expense Summary")
+
+    if df_all.empty:
+        st.info("No data yet. Add expenses first.")
+    else:
+        years = sorted(df_all["year"].unique(), reverse=True)
+        c1, c2 = st.columns(2)
+        sel_year = c1.selectbox("Year", years)
+        months_available = sorted(df_all[df_all["year"] == sel_year]["month"].unique())
+        sel_month = c2.selectbox("Month", months_available, format_func=lambda m: calendar.month_name[m],
+                                  index=len(months_available) - 1)
+
+        month_str = f"{sel_year}-{sel_month:02d}"
+        mdf = df_all[(df_all["year"] == sel_year) & (df_all["month"] == sel_month)]
+
+        prev_month_date = date(sel_year, sel_month, 1) - timedelta(days=1)
+        prev_month_str = prev_month_date.strftime("%Y-%m")
+        prev_mdf = df_all[df_all["month_label"] == prev_month_str]
+
+        total_month = mdf["amount"].sum()
+        num_days_with_data = mdf["date"].dt.date.nunique()
+        days_in_month = calendar.monthrange(sel_year, sel_month)[1]
+        avg_daily = total_month / days_in_month if days_in_month else 0
+        num_tx = len(mdf)
+
+        income_row = income_all[income_all["month"] == month_str]
+        income_amt = float(income_row["amount"].iloc[0]) if not income_row.empty else 0.0
+        savings = income_amt - total_month
+        savings_pct = (savings / income_amt * 100) if income_amt > 0 else 0
+
+        budget_rows = budgets_all[budgets_all["month"] == month_str]
+        total_budget = budget_rows["amount"].sum() if not budget_rows.empty else 0.0
+        remaining_budget = total_budget - total_month
+
+        prev_total = prev_mdf["amount"].sum()
+        mom_change = total_month - prev_total
+        mom_pct = (mom_change / prev_total * 100) if prev_total > 0 else 0
+
+        st.subheader(f"{calendar.month_name[sel_month]} {sel_year}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Monthly Expense", fmt(total_month))
+        c2.metric("Average Daily Expense", fmt(avg_daily))
+        c3.metric("Number of Transactions", num_tx)
+        c4.metric("Month-over-Month", fmt(mom_change), delta=f"{mom_pct:+.1f}%", delta_color="inverse")
+
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Monthly Budget", fmt(total_budget) if total_budget else "Not Set")
+        c6.metric("Remaining Budget", fmt(remaining_budget) if total_budget else "—",
+                  delta=None if not total_budget else ("Over budget" if remaining_budget < 0 else "On track"))
+        c7.metric("Savings", fmt(savings) if income_amt else "Set income")
+        c8.metric("Savings %", pct(savings_pct) if income_amt else "—")
+
+        if not mdf.empty:
+            cat_sum = mdf.groupby("category")["amount"].sum().sort_values(ascending=False)
+            highest_cat = cat_sum.index[0]
+            day_sum = mdf.groupby(mdf["date"].dt.date)["amount"].sum().sort_values(ascending=False)
+            highest_day = day_sum.index[0]
+            st.info(f"🏆 **Highest Spending Category:** {highest_cat} ({fmt(cat_sum.iloc[0])})  |  "
+                    f"📆 **Highest Spending Day:** {highest_day} ({fmt(day_sum.iloc[0])})")
+
+        st.markdown("---")
+        colA, colB = st.columns(2)
+        with colA:
+            st.markdown("#### Category-wise Monthly Expense (% of total)")
+            cat_pct = (mdf.groupby("category")["amount"].sum().sort_values(ascending=False) / total_month * 100) if total_month else pd.Series(dtype=float)
+            if not cat_pct.empty:
+                fig = px.bar(cat_pct, x=cat_pct.values, y=cat_pct.index, orientation="h",
+                             labels={"x": "% of Monthly Total", "y": "Category"}, text_auto=".1f")
+                fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10))
+                st.plotly_chart(fig, use_container_width=True)
+        with colB:
+            st.markdown("#### Category Distribution")
+            if not mdf.empty:
+                cs = mdf.groupby("category")["amount"].sum()
+                st.plotly_chart(px.pie(cs, values=cs.values, names=cs.index, hole=0.4), use_container_width=True)
+
+        colC, colD, colE = st.columns(3)
+        with colC:
+            st.markdown("#### Fixed vs Variable")
+            fv = mdf.groupby("fixed_variable")["amount"].sum()
+            st.plotly_chart(px.pie(fv, values=fv.values, names=fv.index, hole=0.45), use_container_width=True)
+        with colD:
+            st.markdown("#### Need vs Want")
+            nw = mdf.groupby("need_want")["amount"].sum()
+            st.plotly_chart(px.pie(nw, values=nw.values, names=nw.index, hole=0.45), use_container_width=True)
+        with colE:
+            st.markdown("#### Recurring vs One-Time")
+            rc = mdf.groupby("recurring")["amount"].sum()
+            st.plotly_chart(px.pie(rc, values=rc.values, names=rc.index, hole=0.45), use_container_width=True)
+
+        st.markdown("#### Daily Spending Through the Month")
+        if not mdf.empty:
+            daily = mdf.groupby(mdf["date"].dt.date)["amount"].sum().reset_index()
+            fig = px.bar(daily, x="date", y="amount", labels={"date": "Date", "amount": "Amount"})
+            fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("#### Budget vs Actual by Category")
+        if not budget_rows.empty:
+            actual_cat = mdf.groupby("category")["amount"].sum()
+            comp = budget_rows.set_index("category")["amount"].to_frame("Budget")
+            comp["Actual"] = actual_cat.reindex(comp.index).fillna(0)
+            comp = comp.reset_index().rename(columns={"category": "Category"})
+            fig = go.Figure()
+            fig.add_bar(name="Budget", x=comp["Category"], y=comp["Budget"])
+            fig.add_bar(name="Actual", x=comp["Category"], y=comp["Actual"])
+            fig.update_layout(barmode="group", height=380, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.caption("No category budgets set for this month yet — set them in 'Budget & Income Settings'.")
+
+# ============================================================================
+# PAGE: YEARLY DASHBOARD
+# ============================================================================
+elif nav == "📆 Yearly Dashboard":
+    st.title("📆 Yearly Expense Summary")
+
+    if df_all.empty:
+        st.info("No data yet. Add expenses first.")
+    else:
+        years = sorted(df_all["year"].unique(), reverse=True)
+        sel_year = st.selectbox("Year", years)
+        ydf = df_all[df_all["year"] == sel_year]
+
+        total_year = ydf["amount"].sum()
+        months_with_data = ydf["month"].nunique()
+        avg_monthly = total_year / months_with_data if months_with_data else 0
+        days_elapsed = ydf["date"].dt.date.nunique()
+        first_day = date(sel_year, 1, 1)
+        last_day = ydf["date"].max().date() if not ydf.empty else first_day
+        span_days = (last_day - first_day).days + 1
+        avg_daily = total_year / span_days if span_days else 0
+
+        monthly_totals = ydf.groupby("month")["amount"].sum()
+        highest_month = monthly_totals.idxmax() if not monthly_totals.empty else None
+        lowest_month = monthly_totals.idxmin() if not monthly_totals.empty else None
+        cat_totals = ydf.groupby("category")["amount"].sum().sort_values(ascending=False)
+        highest_cat = cat_totals.index[0] if not cat_totals.empty else "—"
+
+        income_year = income_all[income_all["month"].str.startswith(str(sel_year))]
+        total_income = income_year["amount"].sum() if not income_year.empty else 0.0
+        total_savings = total_income - total_year
+        savings_pct = (total_savings / total_income * 100) if total_income > 0 else 0
+
+        budget_year = budgets_all[budgets_all["month"].str.startswith(str(sel_year))]
+        annual_budget = budget_year["amount"].sum() if not budget_year.empty else 0.0
+
+        today = date.today()
+        if sel_year == today.year:
+            ytd = ydf[ydf["date"].dt.date <= today]["amount"].sum()
+            days_so_far = (today - first_day).days + 1
+            projected = (ytd / days_so_far) * 365 if days_so_far else 0
+        else:
+            ytd = total_year
+            projected = total_year
+
+        st.subheader(f"Year {sel_year}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Annual Expense", fmt(total_year))
+        c2.metric("Average Monthly Expense", fmt(avg_monthly))
+        c3.metric("Average Daily Expense", fmt(avg_daily))
+        c4.metric("Year-to-Date Expense", fmt(ytd))
+
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Annual Budget", fmt(annual_budget) if annual_budget else "Not Set")
+        c6.metric("Budget Remaining", fmt(annual_budget - total_year) if annual_budget else "—")
+        c7.metric("Total Savings", fmt(total_savings) if total_income else "Set income")
+        c8.metric("Savings %", pct(savings_pct) if total_income else "—")
+
+        st.info(
+            f"🏆 **Highest Spending Month:** {calendar.month_name[highest_month] if highest_month else '—'} "
+            f"({fmt(monthly_totals.max()) if not monthly_totals.empty else '—'})  |  "
+            f"📉 **Lowest Spending Month:** {calendar.month_name[lowest_month] if lowest_month else '—'} "
+            f"({fmt(monthly_totals.min()) if not monthly_totals.empty else '—'})  |  "
+            f"🥇 **Top Category:** {highest_cat}  |  "
+            f"🔮 **Projected Annual Expense:** {fmt(projected)}"
+        )
+
+        st.markdown("---")
+        colA, colB = st.columns(2)
+        with colA:
+            st.markdown("#### Monthly Expense Trend")
+            mt = monthly_totals.reindex(range(1, 13), fill_value=0)
+            fig = px.line(x=[calendar.month_abbr[m] for m in mt.index], y=mt.values, markers=True,
+                          labels={"x": "Month", "y": "Amount"})
+            fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+        with colB:
+            st.markdown("#### Category-wise Annual Expense")
+            fig = px.pie(cat_totals, values=cat_totals.values, names=cat_totals.index, hole=0.4)
+            fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+        colC, colD, colE = st.columns(3)
+        with colC:
+            st.markdown("#### Fixed vs Variable")
+            fv = ydf.groupby("fixed_variable")["amount"].sum()
+            st.plotly_chart(px.pie(fv, values=fv.values, names=fv.index, hole=0.45), use_container_width=True)
+        with colD:
+            st.markdown("#### Need vs Want")
+            nw = ydf.groupby("need_want")["amount"].sum()
+            st.plotly_chart(px.pie(nw, values=nw.values, names=nw.index, hole=0.45), use_container_width=True)
+        with colE:
+            st.markdown("#### Recurring vs One-Time")
+            rc = ydf.groupby("recurring")["amount"].sum()
+            st.plotly_chart(px.pie(rc, values=rc.values, names=rc.index, hole=0.45), use_container_width=True)
+
+        st.markdown("#### Month-over-Month Growth / Reduction")
+        mt_df = mt.reset_index()
+        mt_df.columns = ["month", "amount"]
+        mt_df["change_pct"] = mt_df["amount"].pct_change().fillna(0) * 100
+        mt_df["month_name"] = mt_df["month"].apply(lambda m: calendar.month_abbr[m])
+        fig = px.bar(mt_df, x="month_name", y="change_pct", labels={"month_name": "Month", "change_pct": "% Change vs Prior Month"})
+        fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("#### Annual Budget vs Actual (Monthly)")
+        if not budget_year.empty:
+            budget_monthly = budget_year.copy()
+            budget_monthly["month_num"] = budget_monthly["month"].str.split("-").str[1].astype(int)
+            budget_monthly = budget_monthly.groupby("month_num")["amount"].sum().reindex(range(1, 13), fill_value=0)
+            fig = go.Figure()
+            fig.add_bar(name="Budget", x=[calendar.month_abbr[m] for m in range(1, 13)], y=budget_monthly.values)
+            fig.add_bar(name="Actual", x=[calendar.month_abbr[m] for m in range(1, 13)], y=mt.values)
+            fig.update_layout(barmode="group", height=380, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.caption("No budgets set for this year yet.")
+
+# ============================================================================
+# PAGE: CATEGORY ANALYSIS
+# ============================================================================
+elif nav == "📊 Category Analysis":
+    st.title("📊 Category-wise Analysis")
+
+    if df_all.empty:
+        st.info("No data yet. Add expenses first.")
+    else:
+        c1, c2 = st.columns(2)
+        date_range = c1.date_input("Date range", value=(df_all["date"].min().date(), df_all["date"].max().date()))
+        cat_filter = c2.multiselect("Filter categories (optional)", CATEGORIES)
+
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            start_d, end_d = date_range
+        else:
+            start_d, end_d = df_all["date"].min().date(), df_all["date"].max().date()
+
+        fdf = df_all[(df_all["date"].dt.date >= start_d) & (df_all["date"].dt.date <= end_d)]
+        if cat_filter:
+            fdf = fdf[fdf["category"].isin(cat_filter)]
+
+        if fdf.empty:
+            st.warning("No transactions in this range.")
+        else:
+            total = fdf["amount"].sum()
+            st.metric("Total Spend in Range", fmt(total))
+
+            st.markdown("#### Top 10 Expense Categories")
+            top10 = fdf.groupby("category")["amount"].sum().sort_values(ascending=False).head(10)
+            fig = px.bar(top10, x=top10.values, y=top10.index, orientation="h", text_auto=".2s",
+                         labels={"x": "Amount", "y": "Category"})
+            fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("#### Category → Sub-Category Breakdown")
+            sub = fdf.groupby(["category", "subcategory"])["amount"].sum().reset_index()
+            fig = px.treemap(sub, path=["category", "subcategory"], values="amount")
+            fig.update_layout(height=450, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("#### Category Summary Table")
+            summary = fdf.groupby("category").agg(
+                Total=("amount", "sum"),
+                Transactions=("amount", "count"),
+                Average=("amount", "mean"),
+            ).sort_values("Total", ascending=False)
+            summary["% of Total"] = (summary["Total"] / total * 100).round(1)
+            summary["Total"] = summary["Total"].map(fmt)
+            summary["Average"] = summary["Average"].map(fmt)
+            st.dataframe(summary, use_container_width=True)
+
+# ============================================================================
+# PAGE: BUDGET & INCOME SETTINGS
+# ============================================================================
+elif nav == "💵 Budget & Income Settings":
+    st.title("💵 Budget & Income Settings")
+    st.caption("Set your monthly income and category-wise budgets. These drive Budget vs Actual and Savings calculations across the app.")
+
+    sel_month = st.date_input("Select month to configure", value=date.today().replace(day=1))
+    month_str = sel_month.strftime("%Y-%m")
+
+    st.subheader(f"Income — {month_label_to_name(month_str)}")
+    existing_income = income_all[income_all["month"] == month_str]
+    default_income = float(existing_income["amount"].iloc[0]) if not existing_income.empty else 0.0
+    inc_val = st.number_input("Monthly Income", min_value=0.0, value=default_income, step=1000.0, format="%.2f")
+    if st.button("💾 Save Income"):
+        set_income(month_str, inc_val)
+        bump_token()
+        st.success(f"Income for {month_label_to_name(month_str)} saved: {fmt(inc_val)}")
+        st.rerun()
+
+    st.markdown("---")
+    st.subheader(f"Category Budgets — {month_label_to_name(month_str)}")
+    existing_budgets = budgets_all[budgets_all["month"] == month_str].set_index("category")["amount"].to_dict()
+
+    with st.form("budget_form"):
+        budget_inputs = {}
+        cols = st.columns(3)
+        for i, cat in enumerate(CATEGORIES):
+            with cols[i % 3]:
+                budget_inputs[cat] = st.number_input(
+                    cat, min_value=0.0, value=float(existing_budgets.get(cat, 0.0)),
+                    step=500.0, key=f"budget_{cat}"
+                )
+        save_budgets = st.form_submit_button("💾 Save All Category Budgets", type="primary")
+        if save_budgets:
+            for cat, amt in budget_inputs.items():
+                if amt > 0:
+                    set_budget(month_str, cat, amt)
+            bump_token()
+            st.success(f"Budgets saved for {month_label_to_name(month_str)}. Total budget: {fmt(sum(budget_inputs.values()))}")
             st.rerun()
 
     st.markdown("---")
-    st.subheader("Today's Entries")
-    today_str = date.today().strftime(DATE_FMT)
-    today_df = df_all[df_all["date"].dt.strftime(DATE_FMT) == today_str] if not df_all.empty else pd.DataFrame()
-    if today_df.empty:
-        st.info("No expenses logged for today yet.")
-    else:
-        st.dataframe(
-            today_df[["date", "category", "subcategory", "description", "payment_method", "amount", "need_want", "recurring", "person"]],
-            use_container_width=True, hide_index=True,
-        )
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Today's Total", money(today_df["amount"].sum()))
-        c2.metric("Transactions", len(today_df))
-        c3.metric("Highest Expense", money(today_df["amount"].max()))
+    st.subheader("All Saved Income Records")
+    if not income_all.empty:
+        st.dataframe(income_all.assign(month_name=income_all["month"].apply(month_label_to_name))
+                     [["month_name", "amount"]].rename(columns={"month_name": "Month", "amount": "Income"}),
+                     use_container_width=True, hide_index=True)
+    st.subheader("All Saved Budgets")
+    if not budgets_all.empty:
+        bt = budgets_all.copy()
+        bt["Month"] = bt["month"].apply(month_label_to_name)
+        st.dataframe(bt[["Month", "category", "amount"]].rename(columns={"category": "Category", "amount": "Budget"}),
+                     use_container_width=True, hide_index=True)
 
-# ==========================================================================
-# PAGE 2: TRANSACTIONS (view / edit / delete)
-# ==========================================================================
-elif page == "📋 Transactions":
-    st.title("📋 All Transactions")
+# ============================================================================
+# PAGE: SAVINGS ANALYSIS
+# ============================================================================
+elif nav == "🏦 Savings Analysis":
+    st.title("🏦 Savings Analysis")
+
+    if income_all.empty:
+        st.info("Set your monthly income in 'Budget & Income Settings' to see savings analysis.")
+    else:
+        merged = income_all.copy()
+        exp_by_month = df_all.groupby("month_label")["amount"].sum() if not df_all.empty else pd.Series(dtype=float)
+        merged["expense"] = merged["month"].map(exp_by_month).fillna(0)
+        merged["savings"] = merged["amount"] - merged["expense"]
+        merged["savings_pct"] = np.where(merged["amount"] > 0, merged["savings"] / merged["amount"] * 100, 0)
+        merged["month_name"] = merged["month"].apply(month_label_to_name)
+        merged = merged.sort_values("month")
+
+        total_income = merged["amount"].sum()
+        total_expense = merged["expense"].sum()
+        total_savings = merged["savings"].sum()
+        overall_pct = (total_savings / total_income * 100) if total_income else 0
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Income (tracked months)", fmt(total_income))
+        c2.metric("Total Expense (tracked months)", fmt(total_expense))
+        c3.metric("Total Savings", fmt(total_savings))
+        c4.metric("Overall Savings %", pct(overall_pct))
+
+        st.markdown("#### Monthly Savings Trend")
+        fig = go.Figure()
+        fig.add_bar(name="Income", x=merged["month_name"], y=merged["amount"])
+        fig.add_bar(name="Expense", x=merged["month_name"], y=merged["expense"])
+        fig.add_scatter(name="Savings", x=merged["month_name"], y=merged["savings"], mode="lines+markers", yaxis="y")
+        fig.update_layout(barmode="group", height=420, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("#### Savings % by Month")
+        fig2 = px.line(merged, x="month_name", y="savings_pct", markers=True,
+                       labels={"month_name": "Month", "savings_pct": "Savings %"})
+        fig2.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        st.markdown("#### Details")
+        show = merged[["month_name", "amount", "expense", "savings", "savings_pct"]].rename(columns={
+            "month_name": "Month", "amount": "Income", "expense": "Expense",
+            "savings": "Savings", "savings_pct": "Savings %"
+        })
+        show["Income"] = show["Income"].map(fmt)
+        show["Expense"] = show["Expense"].map(fmt)
+        show["Savings"] = show["Savings"].map(fmt)
+        show["Savings %"] = show["Savings %"].map(pct)
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+# ============================================================================
+# PAGE: RECURRING TRACKER
+# ============================================================================
+elif nav == "🔁 Recurring Tracker":
+    st.title("🔁 Recurring Expense Tracker")
 
     if df_all.empty:
-        st.info("No expenses recorded yet.")
+        st.info("No data yet. Add expenses first.")
     else:
-        fcol1, fcol2, fcol3, fcol4 = st.columns(4)
-        with fcol1:
-            f_month = st.multiselect("Month", month_options(df_all))
-        with fcol2:
-            f_cat = st.multiselect("Category", sorted(df_all["category"].unique()))
-        with fcol3:
-            f_person = st.multiselect("Person", sorted(df_all["person"].dropna().unique()))
-        with fcol4:
-            f_needwant = st.multiselect("Need / Want", ["Need", "Want"])
+        rec_df = df_all[df_all["recurring"] == "Recurring"]
+        if rec_df.empty:
+            st.info("No recurring expenses logged yet.")
+        else:
+            latest_month = df_all["month_label"].max()
+            this_month_rec = rec_df[rec_df["month_label"] == latest_month]
 
-        filtered = df_all.copy()
-        if f_month:
-            filtered = filtered[filtered["month"].isin(f_month)]
-        if f_cat:
-            filtered = filtered[filtered["category"].isin(f_cat)]
-        if f_person:
-            filtered = filtered[filtered["person"].isin(f_person)]
-        if f_needwant:
-            filtered = filtered[filtered["need_want"].isin(f_needwant)]
+            c1, c2 = st.columns(2)
+            c1.metric(f"Recurring Spend — {month_label_to_name(latest_month)}", fmt(this_month_rec["amount"].sum()))
+            c2.metric("Recurring as % of that Month's Total",
+                     pct(this_month_rec["amount"].sum() / df_all[df_all["month_label"] == latest_month]["amount"].sum() * 100)
+                     if df_all[df_all["month_label"] == latest_month]["amount"].sum() else "0.0%")
 
-        st.dataframe(
-            filtered[["id", "date", "day", "category", "subcategory", "description",
-                      "payment_method", "amount", "need_want", "recurring", "person", "notes"]],
-            use_container_width=True, hide_index=True, height=420,
-        )
-        st.caption(f"Showing {len(filtered)} of {len(df_all)} transactions — Total: {money(filtered['amount'].sum())}")
+            st.markdown("#### Recurring Expenses by Category / Sub-Category (all-time avg per month)")
+            months_count = df_all["month_label"].nunique()
+            rec_summary = rec_df.groupby(["category", "subcategory"]).agg(
+                Total=("amount", "sum"),
+                Count=("amount", "count"),
+            ).reset_index()
+            rec_summary["Avg / Month"] = rec_summary["Total"] / max(months_count, 1)
+            rec_summary = rec_summary.sort_values("Total", ascending=False)
+            rec_summary["Total"] = rec_summary["Total"].map(fmt)
+            rec_summary["Avg / Month"] = rec_summary["Avg / Month"].map(fmt)
+            st.dataframe(rec_summary.rename(columns={"category": "Category", "subcategory": "Sub-Category"}),
+                         use_container_width=True, hide_index=True)
+
+            st.markdown("#### Recurring Spend Trend Over Time")
+            trend = rec_df.groupby("month_label")["amount"].sum().reset_index()
+            trend["month_name"] = trend["month_label"].apply(month_label_to_name)
+            fig = px.line(trend, x="month_name", y="amount", markers=True,
+                         labels={"month_name": "Month", "amount": "Recurring Spend"})
+            fig.update_layout(height=350, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("#### All Recurring Transactions")
+            st.dataframe(rec_df[["date", "category", "subcategory", "description", "amount", "person"]]
+                         .sort_values("date", ascending=False),
+                         use_container_width=True, hide_index=True)
+
+# ============================================================================
+# PAGE: TRENDS & CHARTS
+# ============================================================================
+elif nav == "📈 Trends & Charts":
+    st.title("📈 Expense Trends & Charts")
+
+    if df_all.empty:
+        st.info("No data yet. Add expenses first.")
+    else:
+        st.markdown("#### Overall Monthly Expense Trend (all years)")
+        trend = df_all.groupby("month_label")["amount"].sum().reset_index().sort_values("month_label")
+        trend["month_name"] = trend["month_label"].apply(month_label_to_name)
+        fig = px.line(trend, x="month_name", y="amount", markers=True,
+                     labels={"month_name": "Month", "amount": "Total Expense"})
+        fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("#### Category-wise Expense Distribution (all-time)")
+        cat_all = df_all.groupby("category")["amount"].sum().sort_values(ascending=False)
+        fig = px.pie(cat_all, values=cat_all.values, names=cat_all.index, hole=0.4)
+        fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("#### Top 10 Expense Categories (all-time)")
+        top10 = cat_all.head(10)
+        fig = px.bar(top10, x=top10.values, y=top10.index, orientation="h", text_auto=".2s",
+                     labels={"x": "Amount", "y": "Category"})
+        fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+        colA, colB = st.columns(2)
+        with colA:
+            st.markdown("#### Fixed vs Variable (all-time)")
+            fv = df_all.groupby("fixed_variable")["amount"].sum()
+            st.plotly_chart(px.pie(fv, values=fv.values, names=fv.index, hole=0.45), use_container_width=True)
+        with colB:
+            st.markdown("#### Need vs Want (all-time)")
+            nw = df_all.groupby("need_want")["amount"].sum()
+            st.plotly_chart(px.pie(nw, values=nw.values, names=nw.index, hole=0.45), use_container_width=True)
+
+        if not budgets_all.empty:
+            st.markdown("#### Monthly Budget vs Actual (all months with a budget set)")
+            b = budgets_all.groupby("month")["amount"].sum().reset_index().rename(columns={"amount": "Budget"})
+            a = df_all.groupby("month_label")["amount"].sum().reset_index().rename(columns={"month_label": "month", "amount": "Actual"})
+            comp = b.merge(a, on="month", how="left").fillna(0).sort_values("month")
+            comp["month_name"] = comp["month"].apply(month_label_to_name)
+            fig = go.Figure()
+            fig.add_bar(name="Budget", x=comp["month_name"], y=comp["Budget"])
+            fig.add_bar(name="Actual", x=comp["month_name"], y=comp["Actual"])
+            fig.update_layout(barmode="group", height=380, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+# ============================================================================
+# PAGE: MONTHLY REVIEW
+# ============================================================================
+elif nav == "📝 Monthly Review":
+    st.title("📝 End-of-Month Financial Summary")
+
+    if df_all.empty:
+        st.info("No data yet. Add expenses first.")
+    else:
+        years = sorted(df_all["year"].unique(), reverse=True)
+        c1, c2 = st.columns(2)
+        sel_year = c1.selectbox("Year", years, key="review_year")
+        months_available = sorted(df_all[df_all["year"] == sel_year]["month"].unique())
+        sel_month = c2.selectbox("Month", months_available, format_func=lambda m: calendar.month_name[m],
+                                  index=len(months_available) - 1, key="review_month")
+
+        month_str = f"{sel_year}-{sel_month:02d}"
+        mdf = df_all[df_all["month_label"] == month_str]
+        prev_month_date = date(sel_year, sel_month, 1) - timedelta(days=1)
+        prev_str = prev_month_date.strftime("%Y-%m")
+        pdf_ = df_all[df_all["month_label"] == prev_str]
+
+        total_month = mdf["amount"].sum()
+        cat_now = mdf.groupby("category")["amount"].sum()
+        cat_prev = pdf_.groupby("category")["amount"].sum()
+        comp = pd.DataFrame({"Now": cat_now, "Prev": cat_prev}).fillna(0)
+        comp["Change"] = comp["Now"] - comp["Prev"]
+        increased = comp[comp["Change"] > 0].sort_values("Change", ascending=False)
+        decreased = comp[comp["Change"] < 0].sort_values("Change")
+
+        income_row = income_all[income_all["month"] == month_str]
+        income_amt = float(income_row["amount"].iloc[0]) if not income_row.empty else 0.0
+        savings = income_amt - total_month
+        budget_rows = budgets_all[budgets_all["month"] == month_str]
+        total_budget = budget_rows["amount"].sum() if not budget_rows.empty else 0.0
+        within_budget = total_month <= total_budget if total_budget else None
+
+        wants = mdf[mdf["need_want"] == "Want"].sort_values("amount", ascending=False)
+        rec_df = mdf[mdf["recurring"] == "Recurring"]
+
+        st.subheader(f"{calendar.month_name[sel_month]} {sel_year} — Summary")
+
+        st.markdown(f"**1. How much did I spend?**  {fmt(total_month)} across {len(mdf)} transactions.")
+
+        if not cat_now.empty:
+            top_cat = cat_now.sort_values(ascending=False)
+            st.markdown(f"**2. Where did I spend the most?**  {top_cat.index[0]} — {fmt(top_cat.iloc[0])} "
+                        f"({top_cat.iloc[0]/total_month*100:.1f}% of the month).")
+        else:
+            st.markdown("**2. Where did I spend the most?**  No data.")
+
+        if not increased.empty:
+            inc_list = ", ".join([f"{c} ({fmt(v)} ↑)" for c, v in increased['Change'].head(5).items()])
+            st.markdown(f"**3. Which expenses increased?**  {inc_list}")
+        else:
+            st.markdown("**3. Which expenses increased?**  None vs. last month.")
+
+        if not decreased.empty:
+            dec_list = ", ".join([f"{c} ({fmt(abs(v))} ↓)" for c, v in decreased['Change'].head(5).items()])
+            st.markdown(f"**4. Which expenses decreased?**  {dec_list}")
+        else:
+            st.markdown("**4. Which expenses decreased?**  None vs. last month.")
+
+        if not wants.empty:
+            top_wants = wants.groupby("category")["amount"].sum().sort_values(ascending=False).head(5)
+            want_list = ", ".join([f"{c} ({fmt(v)})" for c, v in top_wants.items()])
+            st.markdown(f"**5. What were my unnecessary (Want) expenses?**  {want_list}  "
+                        f"— total Wants: {fmt(wants['amount'].sum())}")
+        else:
+            st.markdown("**5. What were my unnecessary (Want) expenses?**  None logged.")
+
+        if not rec_df.empty:
+            rec_top = rec_df.groupby(["category", "subcategory"])["amount"].sum().sort_values(ascending=False).head(5)
+            rec_list = ", ".join([f"{c[0]}/{c[1]} ({fmt(v)})" for c, v in rec_top.items()])
+            st.markdown(f"**6. Recurring expenses that could be reduced?**  Review: {rec_list}")
+        else:
+            st.markdown("**6. Recurring expenses that could be reduced?**  None logged.")
+
+        st.markdown(f"**7. How much did I save?**  "
+                    f"{fmt(savings) if income_amt else 'Set your monthly income to calculate savings.'}")
+
+        if within_budget is not None:
+            st.markdown(f"**8. Did I stay within my budget?**  "
+                        f"{'✅ Yes — ' + fmt(total_budget - total_month) + ' remaining' if within_budget else '⚠️ No — over by ' + fmt(total_month - total_budget)}")
+        else:
+            st.markdown("**8. Did I stay within my budget?**  No budget set for this month.")
+
+        suggestions = []
+        if not wants.empty and total_month > 0 and wants["amount"].sum() / total_month > 0.3:
+            suggestions.append("Wants made up a large share of spend — look for discretionary cuts (dining out, shopping, entertainment).")
+        if not increased.empty:
+            suggestions.append(f"Watch {increased.index[0]} — it rose the most vs. last month.")
+        if within_budget is False:
+            suggestions.append("Reset next month's budget to be realistic, or trim the top overspend category.")
+        if not suggestions:
+            suggestions.append("Spending looks stable — keep tracking and consider increasing your savings/investment allocation.")
+        st.markdown("**9. What should I improve next month?**  " + " ".join(suggestions))
+
+# ============================================================================
+# PAGE: YEARLY REVIEW
+# ============================================================================
+elif nav == "📘 Yearly Review":
+    st.title("📘 Annual Financial Review")
+
+    if df_all.empty:
+        st.info("No data yet. Add expenses first.")
+    else:
+        years = sorted(df_all["year"].unique(), reverse=True)
+        sel_year = st.selectbox("Year", years, key="yreview_year")
+        ydf = df_all[df_all["year"] == sel_year]
+
+        income_year = income_all[income_all["month"].str.startswith(str(sel_year))]
+        total_income = income_year["amount"].sum() if not income_year.empty else 0.0
+        total_expense = ydf["amount"].sum()
+        total_savings = total_income - total_expense
+        savings_pct = (total_savings / total_income * 100) if total_income else 0
+        total_investments = ydf[ydf["category"] == "Investments"]["amount"].sum()
+
+        fixed_total = ydf[ydf["fixed_variable"] == "Fixed"]["amount"].sum()
+        variable_total = ydf[ydf["fixed_variable"] == "Variable"]["amount"].sum()
+
+        top10 = ydf.groupby("category")["amount"].sum().sort_values(ascending=False).head(10)
+        monthly_totals = ydf.groupby("month")["amount"].sum().reindex(range(1, 13), fill_value=0)
+        highest_months = monthly_totals.sort_values(ascending=False).head(3)
+
+        wants = ydf[ydf["need_want"] == "Want"]
+        biggest_unnecessary = wants.sort_values("amount", ascending=False).head(5)
+
+        rec_df = ydf[ydf["recurring"] == "Recurring"]
+        rec_by_cat = rec_df.groupby("category")["amount"].sum().sort_values(ascending=False)
+
+        budget_year = budgets_all[budgets_all["month"].str.startswith(str(sel_year))]
+        annual_budget = budget_year["amount"].sum() if not budget_year.empty else 0.0
+
+        st.subheader(f"Annual Review — {sel_year}")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Income", fmt(total_income) if total_income else "Not set")
+        c2.metric("Total Expenses", fmt(total_expense))
+        c3.metric("Total Savings", fmt(total_savings) if total_income else "—")
+
+        c4, c5, c6 = st.columns(3)
+        c4.metric("Savings %", pct(savings_pct) if total_income else "—")
+        c5.metric("Total Investments", fmt(total_investments))
+        c6.metric("Fixed vs Variable", f"{fmt(fixed_total)} / {fmt(variable_total)}")
 
         st.markdown("---")
-        st.subheader("Delete a Transaction")
-        del_id = st.number_input("Transaction ID to delete", min_value=0, step=1)
-        if st.button("🗑️ Delete", type="secondary"):
-            if del_id > 0:
-                execute("DELETE FROM expenses WHERE id=?", (int(del_id),))
-                st.success(f"Deleted transaction #{int(del_id)}.")
-                st.rerun()
+        st.markdown(f"**Top 10 Expense Categories:** " +
+                    ", ".join([f"{c} ({fmt(v)})" for c, v in top10.items()]))
 
-        st.markdown("---")
-        st.subheader("Export")
-        csv = df_all.drop(columns=["month", "year"]).to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download all data as CSV", csv, "expenses_export.csv", "text/csv")
+        st.markdown(f"**Highest Spending Months:** " +
+                    ", ".join([f"{calendar.month_name[m]} ({fmt(v)})" for m, v in highest_months.items()]))
 
-# ==========================================================================
-# PAGE 3: DASHBOARDS  (Daily / Monthly / Yearly)
-# ==========================================================================
-elif page == "📊 Dashboards":
-    st.title("📊 Dashboards")
-    tab_daily, tab_monthly, tab_yearly = st.tabs(["📅 Daily", "🗓️ Monthly", "📆 Yearly"])
-
-    # ---------------- DAILY ----------------
-    with tab_daily:
-        if df_all.empty:
-            st.info("No data yet.")
+        if not biggest_unnecessary.empty:
+            st.markdown("**Biggest Unnecessary (Want) Expenses:** " +
+                        ", ".join([f"{r['category']} - {r['description'] or r['subcategory']} ({fmt(r['amount'])})"
+                                   for _, r in biggest_unnecessary.iterrows()]))
         else:
-            sel_date = st.date_input("Select date", value=df_all["date"].max().date(), key="daily_sel")
-            day_df = df_all[df_all["date"].dt.date == sel_date]
-            if day_df.empty:
-                st.warning("No expenses for this date.")
-            else:
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Total Expense", money(day_df["amount"].sum()))
-                c2.metric("Transactions", len(day_df))
-                c3.metric("Highest Expense", money(day_df["amount"].max()))
-                c4.metric("Day", sel_date.strftime("%A"))
+            st.markdown("**Biggest Unnecessary (Want) Expenses:** None logged.")
 
-                colA, colB = st.columns(2)
-                with colA:
-                    st.markdown("**Category-wise Spending**")
-                    cat_sum = day_df.groupby("category")["amount"].sum().sort_values(ascending=False)
-                    st.dataframe(cat_sum.reset_index().rename(columns={"amount": "Amount"}), hide_index=True, use_container_width=True)
-                with colB:
-                    st.markdown("**Need vs Want / Recurring vs One-Time**")
-                    nw = day_df.groupby("need_want")["amount"].sum()
-                    rc = day_df.groupby("recurring")["amount"].sum()
-                    st.write("Need vs Want:", {k: money(v) for k, v in nw.items()})
-                    st.write("Recurring vs One-Time:", {k: money(v) for k, v in rc.items()})
+        if not rec_by_cat.empty:
+            st.markdown("**Recurring Expenses (by category):** " +
+                        ", ".join([f"{c} ({fmt(v)})" for c, v in rec_by_cat.head(8).items()]))
 
-                st.dataframe(day_df[["category", "subcategory", "description", "amount", "payment_method", "person"]],
-                             hide_index=True, use_container_width=True)
-
-    # ---------------- MONTHLY ----------------
-    with tab_monthly:
-        if df_all.empty:
-            st.info("No data yet.")
+        if annual_budget:
+            perf = "under budget ✅" if total_expense <= annual_budget else "over budget ⚠️"
+            st.markdown(f"**Budget Performance:** {fmt(total_expense)} spent vs {fmt(annual_budget)} budgeted — {perf}.")
         else:
-            sel_month = st.selectbox("Select month", month_options(df_all), key="monthly_sel")
-            mdf = df_all[df_all["month"] == sel_month]
-            prev_m = prev_month_str(sel_month)
-            pmdf = df_all[df_all["month"] == prev_m]
+            st.markdown("**Budget Performance:** No annual budget set.")
 
-            total_month = mdf["amount"].sum()
-            days_in_month = mdf["date"].dt.day.max() if not mdf.empty else 1
-            avg_daily = total_month / max(days_in_month, 1)
-            prev_total = pmdf["amount"].sum()
-            mom_change = ((total_month - prev_total) / prev_total * 100) if prev_total else None
+        st.markdown("#### Monthly Spending Trend")
+        fig = px.line(x=[calendar.month_abbr[m] for m in monthly_totals.index], y=monthly_totals.values, markers=True,
+                     labels={"x": "Month", "y": "Amount"})
+        fig.update_layout(height=350, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
 
-            budget_total = get_budget_for(sel_month, "__TOTAL__", budgets_df)
-            income_row = income_df[income_df["month"] == sel_month]
-            income_amt = float(income_row["amount"].iloc[0]) if not income_row.empty else 0.0
-            savings_amt = income_amt - total_month
-            savings_pct = (savings_amt / income_amt * 100) if income_amt else None
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total Monthly Expense", money(total_month))
-            c2.metric("Avg Daily Expense", money(avg_daily))
-            c3.metric("Transactions", len(mdf))
-            c4.metric("MoM Change", pct(mom_change) if mom_change is not None else "N/A",
-                      delta=pct(mom_change) if mom_change is not None else None)
-
-            c5, c6, c7, c8 = st.columns(4)
-            c5.metric("Budget", money(budget_total) if budget_total else "Not set")
-            c6.metric("Remaining Budget", money(budget_total - total_month) if budget_total else "N/A")
-            c7.metric("Savings", money(savings_amt) if income_amt else "Set income →")
-            c8.metric("Savings %", pct(savings_pct) if savings_pct is not None else "N/A")
-
-            if not mdf.empty:
-                cat_sum = mdf.groupby("category")["amount"].sum().sort_values(ascending=False)
-                top_cat = cat_sum.index[0]
-                day_sum = mdf.groupby(mdf["date"].dt.date)["amount"].sum()
-                top_day = day_sum.idxmax()
-
-                colA, colB = st.columns(2)
-                colA.metric("Highest Spending Category", f"{top_cat} ({money(cat_sum.iloc[0])})")
-                colB.metric("Highest Spending Day", f"{top_day} ({money(day_sum.max())})")
-
-                st.markdown("**Category-wise Monthly Expense & % Share**")
-                cat_table = cat_sum.reset_index().rename(columns={"amount": "Amount"})
-                cat_table["% of Total"] = (cat_table["Amount"] / total_month * 100).round(1)
-                st.dataframe(cat_table, hide_index=True, use_container_width=True)
-
-                fixvar = mdf.copy()
-                fixvar["classification"] = fixvar["category"].map(class_map).fillna("Variable")
-                colC, colD, colE = st.columns(3)
-                with colC:
-                    st.markdown("**Fixed vs Variable**")
-                    st.write({k: money(v) for k, v in fixvar.groupby("classification")["amount"].sum().items()})
-                with colD:
-                    st.markdown("**Need vs Want**")
-                    st.write({k: money(v) for k, v in mdf.groupby("need_want")["amount"].sum().items()})
-                with colE:
-                    st.markdown("**Recurring vs One-Time**")
-                    st.write({k: money(v) for k, v in mdf.groupby("recurring")["amount"].sum().items()})
-
-    # ---------------- YEARLY ----------------
-    with tab_yearly:
-        if df_all.empty:
-            st.info("No data yet.")
+        st.markdown("#### Recommendations")
+        recs = []
+        if not top10.empty:
+            recs.append(f"Focus reduction efforts on **{top10.index[0]}**, your largest category ({fmt(top10.iloc[0])}).")
+        if not wants.empty and total_expense > 0:
+            want_share = wants["amount"].sum() / total_expense * 100
+            recs.append(f"Discretionary (Want) spend was {want_share:.1f}% of total — consider trimming to below 25-30%.")
+        if total_income:
+            target = max(savings_pct + 5, 20)
+            recs.append(f"Current savings rate is {savings_pct:.1f}%. Consider targeting **{target:.0f}%+** next year.")
         else:
-            sel_year = st.selectbox("Select year", year_options(df_all), key="yearly_sel")
-            ydf = df_all[df_all["year"] == sel_year]
+            recs.append("Set your monthly income in Settings to unlock savings-rate recommendations.")
+        for r in recs:
+            st.markdown(f"- {r}")
 
-            total_year = ydf["amount"].sum()
-            months_present = ydf["month"].nunique()
-            avg_monthly = total_year / max(months_present, 1)
-            days_present = ydf["date"].dt.date.nunique()
-            avg_daily_y = total_year / max(days_present, 1)
-
-            budget_year = sum(
-                get_budget_for(m, "__TOTAL__", budgets_df)
-                for m in sorted(ydf["month"].unique())
-            )
-            income_year = income_df[income_df["month"].isin(ydf["month"].unique())]["amount"].sum()
-            savings_year = income_year - total_year
-            savings_pct_y = (savings_year / income_year * 100) if income_year else None
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total Annual Expense", money(total_year))
-            c2.metric("Avg Monthly Expense", money(avg_monthly))
-            c3.metric("Avg Daily Expense", money(avg_daily_y))
-            c4.metric("Transactions", len(ydf))
-
-            c5, c6, c7, c8 = st.columns(4)
-            c5.metric("Annual Budget", money(budget_year) if budget_year else "Not set")
-            c6.metric("Budget vs Actual", money(budget_year - total_year) if budget_year else "N/A")
-            c7.metric("Total Savings", money(savings_year) if income_year else "Set income →")
-            c8.metric("Savings %", pct(savings_pct_y) if savings_pct_y is not None else "N/A")
-
-            monthly_trend = ydf.groupby("month")["amount"].sum().sort_index()
-            if not monthly_trend.empty:
-                highest_month = monthly_trend.idxmax()
-                lowest_month = monthly_trend.idxmin()
-                colA, colB = st.columns(2)
-                colA.metric("Highest Spending Month", f"{highest_month} ({money(monthly_trend.max())})")
-                colB.metric("Lowest Spending Month", f"{lowest_month} ({money(monthly_trend.min())})")
-
-                # Month-over-month growth
-                mom_growth = monthly_trend.pct_change().fillna(0) * 100
-                st.markdown("**Monthly Trend & MoM Growth**")
-                trend_table = pd.DataFrame({
-                    "Month": monthly_trend.index,
-                    "Expense": monthly_trend.values,
-                    "MoM Growth %": mom_growth.round(1).values,
-                })
-                st.dataframe(trend_table, hide_index=True, use_container_width=True)
-
-                fig = px.line(trend_table, x="Month", y="Expense", markers=True, title="Monthly Expense Trend")
-                st.plotly_chart(fig, use_container_width=True)
-
-            cat_sum_y = ydf.groupby("category")["amount"].sum().sort_values(ascending=False)
-            if not cat_sum_y.empty:
-                st.metric("Highest Spending Category (Year)", f"{cat_sum_y.index[0]} ({money(cat_sum_y.iloc[0])})")
-
-            # Year-to-date & projection
-            today = date.today()
-            if sel_year == today.year:
-                ytd = ydf[ydf["date"].dt.date <= today]["amount"].sum()
-                days_elapsed = (today - date(today.year, 1, 1)).days + 1
-                projected = ytd / max(days_elapsed, 1) * 365
-                c9, c10 = st.columns(2)
-                c9.metric("Year-to-Date Expense", money(ytd))
-                c10.metric("Projected Annual Expense", money(projected))
-
-# ==========================================================================
-# PAGE 4: DEEP ANALYSIS
-# ==========================================================================
-elif page == "🔍 Deep Analysis":
-    st.title("🔍 Deep Analysis")
+# ============================================================================
+# PAGE: DATA / EXPORT
+# ============================================================================
+elif nav == "🗂️ Data / Export":
+    st.title("🗂️ Data / Export")
 
     if df_all.empty:
         st.info("No data yet.")
     else:
-        (tab_cat, tab_budget, tab_savings, tab_fixvar,
-         tab_needwant, tab_recurring, tab_trend) = st.tabs(
-            ["🏷️ Category", "💰 Budget vs Actual", "🐷 Savings",
-             "🏠 Fixed vs Variable", "🎯 Need vs Want", "🔁 Recurring", "📈 Trends"]
-        )
-
-        # ---- Category Analysis ----
-        with tab_cat:
-            scope = st.radio("Scope", ["All Time", "By Month", "By Year"], horizontal=True, key="cat_scope")
-            cdf = df_all
-            if scope == "By Month":
-                m = st.selectbox("Month", month_options(df_all), key="cat_month")
-                cdf = df_all[df_all["month"] == m]
-            elif scope == "By Year":
-                y = st.selectbox("Year", year_options(df_all), key="cat_year")
-                cdf = df_all[df_all["year"] == y]
-
-            cat_sum = cdf.groupby("category")["amount"].sum().sort_values(ascending=False)
-            fig1 = px.pie(values=cat_sum.values, names=cat_sum.index, title="Category-wise Expense Distribution", hole=0.4)
-            st.plotly_chart(fig1, use_container_width=True)
-
-            top10 = cat_sum.head(10)
-            fig2 = px.bar(x=top10.values, y=top10.index, orientation="h", title="Top 10 Expense Categories",
-                          labels={"x": "Amount", "y": "Category"})
-            fig2.update_yaxes(autorange="reversed")
-            st.plotly_chart(fig2, use_container_width=True)
-
-            st.markdown("**Sub-Category Breakdown**")
-            sub_sum = cdf.groupby(["category", "subcategory"])["amount"].sum().sort_values(ascending=False).reset_index()
-            st.dataframe(sub_sum.rename(columns={"amount": "Amount"}), hide_index=True, use_container_width=True, height=300)
-
-        # ---- Budget vs Actual ----
-        with tab_budget:
-            b_month = st.selectbox("Month", month_options(df_all), key="budget_month")
-            st.markdown("#### Set / Update Budgets")
-            bcol1, bcol2, bcol3 = st.columns(3)
-            with bcol1:
-                total_budget_val = get_budget_for(b_month, "__TOTAL__", load_budgets())
-                new_total_budget = st.number_input("Overall Monthly Budget (₹)", min_value=0.0, step=500.0,
-                                                     value=float(total_budget_val), key="total_budget_input")
-            with bcol2:
-                b_cat = st.selectbox("Category", list(CATEGORY_MAP.keys()), key="budget_cat")
-            with bcol3:
-                cat_budget_val = get_budget_for(b_month, b_cat, load_budgets())
-                new_cat_budget = st.number_input(f"Budget for {b_cat} (₹)", min_value=0.0, step=100.0,
-                                                   value=float(cat_budget_val), key="cat_budget_input")
-            if st.button("💾 Save Budgets"):
-                upsert_budget(b_month, "__TOTAL__", new_total_budget)
-                upsert_budget(b_month, b_cat, new_cat_budget)
-                st.success("Budgets saved.")
-                st.rerun()
-
-            st.markdown("---")
-            bdf = df_all[df_all["month"] == b_month]
-            actual_total = bdf["amount"].sum()
-            budget_now = get_budget_for(b_month, "__TOTAL__", load_budgets())
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Budget", money(budget_now))
-            c2.metric("Actual", money(actual_total))
-            c3.metric("Remaining", money(budget_now - actual_total))
-
-            budgets_now = load_budgets()
-            budgets_now = budgets_now[(budgets_now["month"] == b_month) & (budgets_now["category"] != "__TOTAL__")]
-            actual_by_cat = bdf.groupby("category")["amount"].sum()
-            comp = budgets_now.set_index("category")["budget_amount"].to_frame("Budget")
-            comp["Actual"] = comp.index.map(lambda c: actual_by_cat.get(c, 0))
-            comp["Remaining"] = comp["Budget"] - comp["Actual"]
-            if not comp.empty:
-                st.dataframe(comp.reset_index(), hide_index=True, use_container_width=True)
-                fig = go.Figure()
-                fig.add_bar(name="Budget", x=comp.index, y=comp["Budget"])
-                fig.add_bar(name="Actual", x=comp.index, y=comp["Actual"])
-                fig.update_layout(barmode="group", title="Budget vs Actual by Category")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No category budgets set for this month yet.")
-
-        # ---- Savings ----
-        with tab_savings:
-            s_month = st.selectbox("Month", month_options(df_all), key="savings_month")
-            income_row = load_income()
-            income_row = income_row[income_row["month"] == s_month]
-            income_val = float(income_row["amount"].iloc[0]) if not income_row.empty else 0.0
-            new_income = st.number_input("Monthly Income (₹)", min_value=0.0, step=1000.0, value=income_val, key="income_input")
-            if st.button("💾 Save Income"):
-                upsert_income(s_month, new_income)
-                st.success("Income saved.")
-                st.rerun()
-
-            sdf = df_all[df_all["month"] == s_month]
-            expense_total = sdf["amount"].sum()
-            savings = new_income - expense_total
-            savings_pct_val = (savings / new_income * 100) if new_income else None
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Income", money(new_income))
-            c2.metric("Expense", money(expense_total))
-            c3.metric("Savings", money(savings))
-            st.metric("Savings %", pct(savings_pct_val) if savings_pct_val is not None else "N/A")
-
-            st.markdown("**Monthly Savings Trend**")
-            inc_all = load_income().set_index("month")["amount"]
-            exp_all = df_all.groupby("month")["amount"].sum()
-            trend = pd.DataFrame({"Income": inc_all, "Expense": exp_all}).fillna(0)
-            trend["Savings"] = trend["Income"] - trend["Expense"]
-            trend = trend.sort_index()
-            if not trend.empty:
-                fig = px.line(trend.reset_index(), x="month", y="Savings", markers=True, title="Monthly Savings Trend")
-                st.plotly_chart(fig, use_container_width=True)
-
-        # ---- Fixed vs Variable ----
-        with tab_fixvar:
-            fv = df_all.copy()
-            fv["classification"] = fv["category"].map(class_map).fillna("Variable")
-            fscope = st.radio("Scope", ["All Time", "By Month", "By Year"], horizontal=True, key="fv_scope")
-            if fscope == "By Month":
-                m = st.selectbox("Month", month_options(df_all), key="fv_month")
-                fv = fv[fv["month"] == m]
-            elif fscope == "By Year":
-                y = st.selectbox("Year", year_options(df_all), key="fv_year")
-                fv = fv[fv["year"] == y]
-            fv_sum = fv.groupby("classification")["amount"].sum()
-            fig = px.pie(values=fv_sum.values, names=fv_sum.index, title="Fixed vs Variable Expenses", hole=0.4)
-            st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(fv_sum.reset_index().rename(columns={"amount": "Amount"}), hide_index=True, use_container_width=True)
-
-        # ---- Need vs Want ----
-        with tab_needwant:
-            nwscope = st.radio("Scope", ["All Time", "By Month", "By Year"], horizontal=True, key="nw_scope")
-            nw = df_all
-            if nwscope == "By Month":
-                m = st.selectbox("Month", month_options(df_all), key="nw_month")
-                nw = df_all[df_all["month"] == m]
-            elif nwscope == "By Year":
-                y = st.selectbox("Year", year_options(df_all), key="nw_year")
-                nw = df_all[df_all["year"] == y]
-            nw_sum = nw.groupby("need_want")["amount"].sum()
-            fig = px.pie(values=nw_sum.values, names=nw_sum.index, title="Need vs Want", hole=0.4)
-            st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(nw_sum.reset_index().rename(columns={"amount": "Amount"}), hide_index=True, use_container_width=True)
-
-        # ---- Recurring Tracker ----
-        with tab_recurring:
-            rec_df = df_all[df_all["recurring"] == "Recurring"]
-            if rec_df.empty:
-                st.info("No recurring expenses logged yet.")
-            else:
-                st.markdown("**Recurring Expenses by Category / Sub-Category (all time)**")
-                rec_sum = rec_df.groupby(["category", "subcategory"])["amount"].agg(["sum", "count", "mean"]).reset_index()
-                rec_sum.columns = ["Category", "Sub-Category", "Total Spent", "Occurrences", "Avg Amount"]
-                rec_sum = rec_sum.sort_values("Total Spent", ascending=False)
-                st.dataframe(rec_sum, hide_index=True, use_container_width=True)
-
-                st.markdown("**Recurring vs One-Time — Monthly Comparison**")
-                rc_trend = df_all.groupby(["month", "recurring"])["amount"].sum().unstack(fill_value=0).sort_index()
-                if not rc_trend.empty:
-                    fig = px.bar(rc_trend.reset_index(), x="month", y=rc_trend.columns.tolist(),
-                                 title="Recurring vs One-Time Expenses by Month", barmode="stack")
-                    st.plotly_chart(fig, use_container_width=True)
-
-                st.caption("💡 Review recurring items with high 'Total Spent' — subscriptions or plans here are prime candidates for reduction.")
-
-        # ---- Trends ----
-        with tab_trend:
-            monthly_trend = df_all.groupby("month")["amount"].sum().sort_index().reset_index()
-            fig1 = px.line(monthly_trend, x="month", y="amount", markers=True, title="Monthly Expense Trend (All Time)")
-            st.plotly_chart(fig1, use_container_width=True)
-
-            cat_month = df_all.groupby(["month", "category"])["amount"].sum().reset_index()
-            fig2 = px.bar(cat_month, x="month", y="amount", color="category", title="Category-wise Monthly Trend")
-            st.plotly_chart(fig2, use_container_width=True)
-
-            payment_sum = df_all.groupby("payment_method")["amount"].sum().sort_values(ascending=False)
-            fig3 = px.bar(x=payment_sum.index, y=payment_sum.values, title="Spending by Payment Method",
-                          labels={"x": "Payment Method", "y": "Amount"})
-            st.plotly_chart(fig3, use_container_width=True)
-
-# ==========================================================================
-# PAGE 5: REPORTS (Month-End / Year-End narrative summaries)
-# ==========================================================================
-elif page == "📑 Reports":
-    st.title("📑 Reports")
-    tab_month_end, tab_year_end = st.tabs(["🗓️ Month-End Summary", "🎊 Year-End Review"])
-
-    with tab_month_end:
-        if df_all.empty:
-            st.info("No data yet.")
-        else:
-            m = st.selectbox("Select month", month_options(df_all), key="report_month")
-            mdf = df_all[df_all["month"] == m]
-            prev_m = prev_month_str(m)
-            pmdf = df_all[df_all["month"] == prev_m]
-
-            total_month = mdf["amount"].sum()
-            budget_total = get_budget_for(m, "__TOTAL__", budgets_df)
-            income_row = income_df[income_df["month"] == m]
-            income_amt = float(income_row["amount"].iloc[0]) if not income_row.empty else 0.0
-            savings_amt = income_amt - total_month
-
-            cat_now = mdf.groupby("category")["amount"].sum()
-            cat_prev = pmdf.groupby("category")["amount"].sum()
-            all_cats_idx = cat_now.index.union(cat_prev.index)
-            diff = cat_now.reindex(all_cats_idx).fillna(0) - cat_prev.reindex(all_cats_idx).fillna(0)
-            increased = diff[diff > 0].sort_values(ascending=False)
-            decreased = diff[diff < 0].sort_values()
-
-            wants_df = mdf[mdf["need_want"] == "Want"].sort_values("amount", ascending=False)
-            recurring_cat = mdf[mdf["recurring"] == "Recurring"].groupby("category")["amount"].sum().sort_values(ascending=False)
-
-            st.markdown(f"## Financial Summary — {m}")
-            st.markdown(f"**1. How much did I spend?**  {money(total_month)} across {len(mdf)} transactions.")
-
-            if not cat_now.empty:
-                st.markdown(f"**2. Where did I spend the most?**  {cat_now.idxmax()} ({money(cat_now.max())}, "
-                            f"{cat_now.max()/total_month*100:.1f}% of the month).")
-            else:
-                st.markdown("**2. Where did I spend the most?**  No data.")
-
-            st.markdown("**3. Which expenses increased (vs previous month)?**")
-            if increased.empty:
-                st.write("- No category increased vs last month.")
-            else:
-                for c, v in increased.head(5).items():
-                    st.write(f"- {c}: +{money(v)}")
-
-            st.markdown("**4. Which expenses decreased (vs previous month)?**")
-            if decreased.empty:
-                st.write("- No category decreased vs last month.")
-            else:
-                for c, v in decreased.head(5).items():
-                    st.write(f"- {c}: {money(v)}")
-
-            st.markdown("**5. What were my unnecessary (Want) expenses?**")
-            if wants_df.empty:
-                st.write("- None logged as 'Want' this month.")
-            else:
-                st.write(f"- Total 'Want' spending: {money(wants_df['amount'].sum())} "
-                         f"({wants_df['amount'].sum()/total_month*100:.1f}% of month)")
-                st.dataframe(wants_df[["date", "category", "subcategory", "description", "amount"]].head(10),
-                             hide_index=True, use_container_width=True)
-
-            st.markdown("**6. What recurring expenses can be reduced?**")
-            if recurring_cat.empty:
-                st.write("- No recurring expenses logged this month.")
-            else:
-                st.dataframe(recurring_cat.reset_index().rename(columns={"amount": "Amount"}).head(10),
-                             hide_index=True, use_container_width=True)
-
-            st.markdown(f"**7. How much did I save?**  "
-                        f"{money(savings_amt) if income_amt else 'Set income in Deep Analysis → Savings tab to compute.'}")
-
-            if budget_total:
-                status = "✅ Within budget" if total_month <= budget_total else "⚠️ Over budget"
-                st.markdown(f"**8. Did I stay within my budget?**  {status} — Budget {money(budget_total)}, "
-                            f"Actual {money(total_month)}, Difference {money(budget_total - total_month)}.")
-            else:
-                st.markdown("**8. Did I stay within my budget?**  No budget set for this month.")
-
-            st.markdown("**9. What should I improve next month?**")
-            tips = []
-            if not increased.empty:
-                tips.append(f"Watch {increased.index[0]} — it rose the most vs last month.")
-            if not wants_df.empty and wants_df["amount"].sum() / total_month > 0.3:
-                tips.append("'Want' spending is over 30% of the month — consider trimming discretionary spend.")
-            if budget_total and total_month > budget_total:
-                tips.append("Overall spending exceeded budget — revisit category budgets or spending pace.")
-            if not tips:
-                tips.append("Spending looks steady — keep tracking consistently and consider raising savings rate.")
-            for t in tips:
-                st.write(f"- {t}")
-
-    with tab_year_end:
-        if df_all.empty:
-            st.info("No data yet.")
-        else:
-            y = st.selectbox("Select year", year_options(df_all), key="report_year")
-            ydf = df_all[df_all["year"] == y]
-
-            total_expense = ydf["amount"].sum()
-            income_year = income_df[income_df["month"].isin(ydf["month"].unique())]["amount"].sum()
-            savings_year = income_year - total_expense
-            savings_pct_y = (savings_year / income_year * 100) if income_year else None
-            invest_total = ydf[ydf["category"] == "Investments"]["amount"].sum()
-
-            fv = ydf.copy()
-            fv["classification"] = fv["category"].map(class_map).fillna("Variable")
-            fixed_total = fv[fv["classification"] == "Fixed"]["amount"].sum()
-            variable_total = fv[fv["classification"] == "Variable"]["amount"].sum()
-
-            cat_sum = ydf.groupby("category")["amount"].sum().sort_values(ascending=False)
-            monthly_trend = ydf.groupby("month")["amount"].sum().sort_index()
-            recurring_sum = ydf[ydf["recurring"] == "Recurring"].groupby("category")["amount"].sum().sort_values(ascending=False)
-            wants_top = ydf[ydf["need_want"] == "Want"].sort_values("amount", ascending=False).head(10)
-            budget_year = sum(get_budget_for(m, "__TOTAL__", budgets_df) for m in ydf["month"].unique())
-
-            st.markdown(f"## Annual Financial Review — {y}")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total Income", money(income_year) if income_year else "Not set")
-            c2.metric("Total Expenses", money(total_expense))
-            c3.metric("Total Savings", money(savings_year) if income_year else "N/A")
-
-            c4, c5, c6 = st.columns(3)
-            c4.metric("Savings %", pct(savings_pct_y) if savings_pct_y is not None else "N/A")
-            c5.metric("Total Investments", money(invest_total))
-            c6.metric("Budget Performance", money(budget_year - total_expense) if budget_year else "No budget set")
-
-            c7, c8 = st.columns(2)
-            c7.metric("Total Fixed Expenses", money(fixed_total))
-            c8.metric("Total Variable Expenses", money(variable_total))
-
-            st.markdown("### Top 10 Expense Categories")
-            st.dataframe(cat_sum.head(10).reset_index().rename(columns={"amount": "Amount"}),
-                         hide_index=True, use_container_width=True)
-
-            st.markdown("### Highest Spending Months")
-            st.dataframe(monthly_trend.sort_values(ascending=False).head(3).reset_index()
-                         .rename(columns={"month": "Month", "amount": "Amount"}),
-                         hide_index=True, use_container_width=True)
-
-            st.markdown("### Biggest Unnecessary (Want) Expenses")
-            if wants_top.empty:
-                st.write("None logged.")
-            else:
-                st.dataframe(wants_top[["date", "category", "description", "amount"]],
-                             hide_index=True, use_container_width=True)
-
-            st.markdown("### Recurring Expenses (by category)")
-            if recurring_sum.empty:
-                st.write("None logged.")
-            else:
-                st.dataframe(recurring_sum.reset_index().rename(columns={"amount": "Amount"}),
-                             hide_index=True, use_container_width=True)
-
-            st.markdown("### Monthly Spending Trend")
-            fig = px.line(monthly_trend.reset_index(), x="month", y="amount", markers=True)
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.markdown("### Recommended Areas for Expense Reduction")
-            top_want_cats = ydf[ydf["need_want"] == "Want"].groupby("category")["amount"].sum().sort_values(ascending=False).head(3)
-            for c, v in top_want_cats.items():
-                st.write(f"- **{c}**: {money(v)} in discretionary ('Want') spending — review for cuts.")
-            if recurring_sum.shape[0] > 0:
-                st.write(f"- **{recurring_sum.index[0]}**: highest recurring spend ({money(recurring_sum.iloc[0])}) — "
-                         f"check for unused subscriptions or renegotiation options.")
-
-            st.markdown("### Recommended Savings Target for Next Year")
-            if income_year:
-                current_rate = savings_pct_y or 0
-                target_rate = min(current_rate + 5, 40)
-                st.write(f"Current savings rate: **{pct(current_rate)}**. "
-                         f"Suggested target for next year: **{pct(target_rate)}** "
-                         f"(≈ {money(income_year * target_rate / 100)} if income stays similar).")
-            else:
-                st.write("Add monthly income figures (Deep Analysis → Savings tab) to get a personalized savings target.")
-
-# ==========================================================================
-# PAGE 6: SETTINGS
-# ==========================================================================
-elif page == "⚙️ Settings":
-    st.title("⚙️ Settings")
-
-    st.subheader("Fixed vs Variable Category Classification")
-    st.caption("Used to compute Fixed vs Variable dashboards. Defaults are pre-set — adjust as needed.")
-    cls_df = run_query("SELECT * FROM category_class ORDER BY category")
-    updated = {}
-    cols = st.columns(2)
-    for i, row in cls_df.iterrows():
-        with cols[i % 2]:
-            val = st.radio(row["category"], ["Fixed", "Variable"],
-                            index=0 if row["classification"] == "Fixed" else 1,
-                            key=f"cls_{row['category']}", horizontal=True)
-            updated[row["category"]] = val
-    if st.button("💾 Save Classification"):
-        for cat, val in updated.items():
-            execute("UPDATE category_class SET classification=? WHERE category=?", (val, cat))
-        st.success("Saved.")
-        st.rerun()
+        st.markdown(f"**Total records:** {len(df_all)}")
+        st.dataframe(df_all.drop(columns=["year", "month", "month_label", "month_name"]),
+                     use_container_width=True, hide_index=True)
+        csv = df_all.drop(columns=["year", "month", "month_label", "month_name"]).to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download all transactions as CSV", data=csv,
+                           file_name="expense_transactions.csv", mime="text/csv")
 
     st.markdown("---")
-    st.subheader("Database Backup")
-    if os.path.exists(DB_PATH):
-        with open(DB_PATH, "rb") as f:
-            st.download_button("⬇️ Download database file (expense_tracker.db)", f, "expense_tracker.db")
-    st.caption(f"Database location: `{DB_PATH}` — this single file holds all your data for every month and year.")
-
-    st.markdown("---")
-    st.subheader("Import Expenses from CSV")
-    st.caption("CSV columns expected: date, category, subcategory, description, payment_method, amount, need_want, recurring, person, notes")
-    uploaded = st.file_uploader("Upload CSV", type="csv")
-    if uploaded is not None:
-        try:
-            imp_df = pd.read_csv(uploaded)
-            imp_df["date"] = pd.to_datetime(imp_df["date"])
-            if st.button("Import rows"):
-                conn = get_conn()
-                cur = conn.cursor()
-                for _, r in imp_df.iterrows():
-                    cur.execute(
-                        """INSERT INTO expenses
-                           (date, day, category, subcategory, description, payment_method,
-                            amount, need_want, recurring, person, notes, created_at)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            r["date"].strftime(DATE_FMT), r["date"].strftime("%A"),
-                            r.get("category", "Miscellaneous"), r.get("subcategory", "Other"),
-                            r.get("description", ""), r.get("payment_method", "Other"),
-                            float(r.get("amount", 0)), r.get("need_want", "Need"),
-                            r.get("recurring", "One-Time"), r.get("person", "Self"),
-                            r.get("notes", ""), datetime.now().isoformat(),
-                        ),
-                    )
-                conn.commit()
-                conn.close()
-                st.success(f"Imported {len(imp_df)} rows.")
-                st.rerun()
-        except Exception as e:
-            st.error(f"Could not parse CSV: {e}")
+    if USING_EXTERNAL_DB:
+        st.caption("Connected to an external Postgres database (set via `DATABASE_URL`). "
+                   "Data persists across restarts and redeploys.")
+    else:
+        st.caption("Using a local SQLite file (`expenses.db`) next to this app. "
+                   "On hosts with an ephemeral filesystem (e.g. Render's free tier), this "
+                   "resets on every restart/redeploy — set `DATABASE_URL` to a free Postgres "
+                   "instance to persist data. See README.md.")
