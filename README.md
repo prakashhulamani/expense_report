@@ -25,6 +25,7 @@ Render you need an external database that lives outside Render's filesystem. Any
 free-tier Postgres works; two easy options:
 
 - **Neon** — https://neon.tech (free tier, no card required for the hobby plan)
+- **Neon Console** - https://console.neon.tech/
 - **Supabase** — https://supabase.com (free tier)
 
 ### Steps
